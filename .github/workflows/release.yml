@@ -60,7 +60,18 @@ jobs:
           TAG: ${{ needs.setup.outputs.tag }}
         run: |
           if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "Release $TAG already exists — reusing it."
+            # Reusing only makes sense while the release is still a DRAFT.
+            # electron-builder uploads into the draft for its version; against an
+            # already-published release it uploads nothing, and every job still
+            # exits 0 — a "successful" run that silently ships no new binary.
+            # Fail loudly instead and say exactly what to do about it.
+            IS_DRAFT="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft -q .isDraft)"
+            if [ "$IS_DRAFT" = "true" ]; then
+              echo "Draft release $TAG already exists — reusing it."
+            else
+              echo "::error::Release $TAG is already published, so this run would upload nothing and ship no new build. Bump the version first (npm version patch|minor) and run again."
+              exit 1
+            fi
           else
             # On a manual run the git tag doesn't exist yet; point the (pending)
             # tag at the dispatched commit. On a tag push the tag already exists
