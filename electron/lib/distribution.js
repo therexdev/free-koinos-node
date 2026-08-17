@@ -2,6 +2,7 @@
 
 const { parseAmount, addSats, subSats, cmpSats, formatAmount } = require("./format");
 const { BURN_MANA_CUSHION } = require("./constants");
+const { fetchAiRoster, validateRosterUrl } = require("./ai-roster");
 
 // Community profit distribution.
 //
@@ -43,6 +44,12 @@ function validateDistributionConfig(cfg) {
   if (cmpSats(parseAmount(minVhpKoin), "0") <= 0) {
     throw new Error("Minimum VHP must be greater than zero");
   }
+  // A blank roster URL is allowed even with the AI gate on — the engine then
+  // fails closed at settlement (pays nobody, carries the pool) and says so,
+  // rather than refusing to save an intent the user can't yet fill in. A
+  // non-blank URL must be well-formed.
+  const aiRosterUrl = String(cfg.aiRosterUrl ?? "").trim();
+  if (aiRosterUrl) validateRosterUrl(aiRosterUrl);
   const hour = Number(cfg.payoutHourUtc);
   if (!Number.isInteger(hour) || hour < 0 || hour > 23) {
     throw new Error("Distribution hour must be a whole number between 0 and 23 (UTC)");
@@ -55,7 +62,10 @@ function validateDistributionConfig(cfg) {
   }
   return {
     enabled: !!cfg.enabled,
+    requireVhpMinimum: !!cfg.requireVhpMinimum,
+    requireAiNode: !!cfg.requireAiNode,
     minVhpKoin,
+    aiRosterUrl,
     payoutHourUtc: hour,
     minPayoutKoin,
     pollMinutes: poll,
@@ -81,6 +91,65 @@ function mergeSeen(seen, headers) {
     seen[h.signer] = cur;
   }
   return seen;
+}
+
+// Fold a roster of live Koinos AI Nodes into the cycle. Mutates + returns.
+function mergeAiSeen(aiSeen, addresses, nowMs) {
+  for (const address of addresses || []) {
+    if (!address) continue;
+    const cur = aiSeen[address] ?? { reads: 0, firstSeenMs: nowMs, lastSeenMs: 0 };
+    cur.reads += 1;
+    cur.lastSeenMs = nowMs;
+    aiSeen[address] = cur;
+  }
+  return aiSeen;
+}
+
+// Decide who shares in a cycle's pool. Two independent gates, both optional:
+//
+//   requireVhpMinimum — the node must be producing blocks AND hold at least
+//                       minVhpSat of VHP ("an active node with the stake")
+//   requireAiNode     — the node must have been seen running a Koinos AI Node
+//                       during the cycle
+//
+// The four combinations, all of which this one function expresses:
+//
+//   neither  → every node seen producing blocks qualifies
+//   VHP only → nodes producing blocks with enough VHP
+//   AI only  → nodes seen on the AI network, whether or not they produce
+//   both     → must be on an AI node *and* producing with enough VHP
+//
+// Block production is required unless the AI gate is carrying the selection on
+// its own — that is what makes "AI only" mean "anyone seen running an AI node".
+// A candidate whose VHP couldn't be read is never assumed to qualify.
+// Pure; `candidates` are { address, producing, aiNode, vhpSat }.
+function selectEligible({ candidates, requireVhpMinimum, requireAiNode, minVhpSat }) {
+  const needsProducing = requireVhpMinimum || !requireAiNode;
+  const eligible = [];
+  const rejected = { notProducing: 0, belowVhp: 0, vhpUnknown: 0, notAiNode: 0 };
+
+  for (const c of candidates || []) {
+    if (needsProducing && !c.producing) {
+      rejected.notProducing += 1;
+      continue;
+    }
+    if (requireVhpMinimum) {
+      if (c.vhpSat == null) {
+        rejected.vhpUnknown += 1; // balance lookup failed — not judged, not paid
+        continue;
+      }
+      if (cmpSats(c.vhpSat, minVhpSat) < 0) {
+        rejected.belowVhp += 1;
+        continue;
+      }
+    }
+    if (requireAiNode && !c.aiNode) {
+      rejected.notAiNode += 1;
+      continue;
+    }
+    eligible.push(c.address);
+  }
+  return { eligible, rejected };
 }
 
 // Close one cycle: how much to reburn, and how the profit pool splits.
@@ -217,6 +286,13 @@ class DistributionEngine {
     return `distribution.${networkId}.${address}`;
   }
 
+  // The network read of the live Koinos AI Node roster. Isolated on the class
+  // so it is the one seam tests replace — everything else about a cycle stays
+  // exercised for real.
+  async _fetchRoster(url) {
+    return fetchAiRoster(url, { isValidAddress: (a) => this.chain.isValidAddress(a) });
+  }
+
   _readState(key) {
     const st = this.state.get(key, null) ?? {
       anchor: null,            // { rewards, vhpConsumed } totals at cycle start
@@ -224,6 +300,8 @@ class DistributionEngine {
       lastClosedAt: null,
       lastScannedHeight: null, // network snapshot progress
       seen: {},                // { [producer]: { blocks, lastSeenHeight, lastSeenMs } }
+      aiSeen: {},              // { [address]: { reads, firstSeenMs, lastSeenMs } }
+      aiReads: { ok: 0, failed: 0, lastError: null }, // roster reads this cycle
       carry: "0",              // undistributed profit carried between cycles
       reburnOwed: "0",         // KOIN still to burn back into VHP
       payouts: [],             // [{ address, amountSat }] waiting to be sent
@@ -231,6 +309,8 @@ class DistributionEngine {
       actions: [],             // executed reburn/payout txs (newest first)
     };
     st.seen ??= {};
+    st.aiSeen ??= {};
+    st.aiReads ??= { ok: 0, failed: 0, lastError: null };
     st.payouts ??= [];
     st.history ??= [];
     st.actions ??= [];
@@ -319,6 +399,29 @@ class DistributionEngine {
       snapshotError = String(e.message);
     }
 
+    // Snapshot the live Koinos AI Node roster the same way — who is serving on
+    // the AI network right now. Only polled when the AI gate is on; failures
+    // are recorded (settlement fails closed on them) but never stall the tick.
+    let rosterError = null;
+    if (cfg.requireAiNode) {
+      if (!cfg.aiRosterUrl) {
+        rosterError = "No Koinos AI Node roster URL is configured";
+        st.aiReads.failed += 1;
+        st.aiReads.lastError = rosterError;
+      } else {
+        try {
+          const roster = await this._fetchRoster(cfg.aiRosterUrl);
+          mergeAiSeen(st.aiSeen, roster.addresses, now);
+          st.aiReads.ok += 1;
+          st.aiReads.lastError = null;
+        } catch (e) {
+          rosterError = String(e.message);
+          st.aiReads.failed += 1;
+          st.aiReads.lastError = rosterError;
+        }
+      }
+    }
+
     // Close the cycle when the daily boundary has passed — but never while the
     // previous cycle's queue is still draining, so cycles can't overlap.
     const dueAt = nextCycleClose(st.lastClosedAt ?? st.cycleStartedAt, cfg.payoutHourUtc);
@@ -352,14 +455,17 @@ class DistributionEngine {
     }
     if (closed) {
       const c = closed;
-      const msg =
-        c.eligibleCount > 0 && cmpSats(c.share, "0") > 0
+      const msg = c.holdReason
+        ? `Cycle closed but held: ${c.holdReason}`
+        : c.eligibleCount > 0 && cmpSats(c.share, "0") > 0
           ? `Cycle closed: ${formatAmount(c.pool)} KOIN profit split between ${c.eligibleCount} nodes ` +
             `(${formatAmount(c.share)} KOIN each) — reburning ${formatAmount(c.reburn)} KOIN to restore VHP.`
           : `Cycle closed: nothing to distribute yet (${formatAmount(c.pool)} KOIN carries over` +
             `${cmpSats(c.reburn, "0") > 0 ? `; reburning ${formatAmount(c.reburn)} KOIN to restore VHP` : ""}).`;
       this.onEvent({ type: "distribution", message: msg });
-      return done("cycle-closed", { closed, progress, snapshotError, message: msg });
+      return done(c.holdReason ? "cycle-held" : "cycle-closed", {
+        closed, progress, snapshotError, rosterError, message: msg,
+      });
     }
     if (progress) {
       const doneCount = progress.executed.length;
@@ -374,11 +480,15 @@ class DistributionEngine {
       if (doneCount > 0) this.onEvent({ type: "distribution", message });
       return done(this._queueEmpty(st) ? "distributed" : "distributing", { progress, snapshotError, message });
     }
+    const aiNote = cfg.requireAiNode
+      ? `, ${Object.keys(st.aiSeen).length} AI nodes seen${rosterError ? ` (roster error: ${rosterError})` : ""}`
+      : "";
     return done("watching", {
       snapshotError,
+      rosterError,
       message: snapshotError
         ? `Watching the network (snapshot hiccup: ${snapshotError})`
-        : `Watching the network — ${Object.keys(st.seen).length} producers seen this cycle. Next distribution at ${new Date(dueAt).toUTCString()}.`,
+        : `Watching the network — ${Object.keys(st.seen).length} producers seen this cycle${aiNote}. Next distribution at ${new Date(dueAt).toUTCString()}.`,
     });
   }
 
@@ -387,18 +497,44 @@ class DistributionEngine {
     const periodRewardsSat = subSats(statsRes.totals.rewards, st.anchor.rewards);
     const periodVhpConsumedSat = subSats(statsRes.totals.vhpConsumed, st.anchor.vhpConsumed);
 
-    // Who was live this cycle, and who has the VHP to qualify.
-    const seenAddresses = Object.keys(st.seen).filter((a) => this.chain.isValidAddress(a));
+    // Who was live this cycle. Block producers always form the pool; addresses
+    // seen only on the AI network join it when the AI gate is on (that is what
+    // lets "AI only" pay a node that serves AI without producing blocks).
+    const producers = Object.keys(st.seen).filter((a) => this.chain.isValidAddress(a));
+    const aiAddresses = cfg.requireAiNode
+      ? Object.keys(st.aiSeen).filter((a) => this.chain.isValidAddress(a))
+      : [];
+    const poolAddresses = [...new Set([...producers, ...aiAddresses])];
+    const producerSet = new Set(producers);
+    const aiSet = new Set(Object.keys(st.aiSeen));
     const minVhpSat = parseAmount(cfg.minVhpKoin);
+
+    // VHP balances are only fetched when the VHP gate is on — with it off the
+    // whole round-trip is skipped.
+    let balances = {};
+    if (cfg.requireVhpMinimum && poolAddresses.length > 0) {
+      balances = await this.chain.vhpBalances(poolAddresses);
+    }
+
+    // Fail closed: with the AI gate on, a cycle where the roster never answered
+    // cannot tell who qualifies. Reburn still happens (the node's VHP must stay
+    // level either way) but nobody is paid and the whole pool carries forward.
+    const aiUnavailable = cfg.requireAiNode && st.aiReads.ok === 0;
     let eligible = [];
-    let checked = 0;
-    if (seenAddresses.length > 0) {
-      const balances = await this.chain.vhpBalances(seenAddresses);
-      for (const a of seenAddresses) {
-        if (balances[a] == null) continue; // balance lookup failed — not judged
-        checked += 1;
-        if (cmpSats(balances[a], minVhpSat) >= 0) eligible.push(a);
-      }
+    let rejected = { notProducing: 0, belowVhp: 0, vhpUnknown: 0, notAiNode: 0 };
+    if (!aiUnavailable) {
+      const candidates = poolAddresses.map((address) => ({
+        address,
+        producing: producerSet.has(address),
+        aiNode: aiSet.has(address),
+        vhpSat: cfg.requireVhpMinimum ? balances[address] ?? null : null,
+      }));
+      ({ eligible, rejected } = selectEligible({
+        candidates,
+        requireVhpMinimum: cfg.requireVhpMinimum,
+        requireAiNode: cfg.requireAiNode,
+        minVhpSat,
+      }));
     }
 
     const settle = settleCycle({
@@ -426,9 +562,20 @@ class DistributionEngine {
       recipientCount: settle.recipients.length,
       selfKept: settle.selfKeptSat,
       carryOut: settle.carryOutSat,
-      seenCount: seenAddresses.length,
-      checkedCount: checked,
-      minVhpKoin: cfg.minVhpKoin,
+      seenCount: producers.length,
+      aiSeenCount: Object.keys(st.aiSeen).length,
+      poolCount: poolAddresses.length,
+      rejected,
+      gates: {
+        requireVhpMinimum: cfg.requireVhpMinimum,
+        requireAiNode: cfg.requireAiNode,
+        minVhpKoin: cfg.minVhpKoin,
+      },
+      // Set when the AI roster never answered this cycle — explains a payout of
+      // nobody, so an empty distribution is never a silent mystery.
+      holdReason: aiUnavailable
+        ? `Koinos AI Node roster unavailable all cycle (${st.aiReads.lastError ?? "no successful read"}) — nobody was paid and the pool carried over.`
+        : null,
     };
     st.history.unshift(record);
     st.history = st.history.slice(0, HISTORY_KEEP);
@@ -436,6 +583,8 @@ class DistributionEngine {
     // Start the next cycle from the current totals, with a fresh snapshot.
     st.anchor = { rewards: statsRes.totals.rewards, vhpConsumed: statsRes.totals.vhpConsumed };
     st.seen = {};
+    st.aiSeen = {};
+    st.aiReads = { ok: 0, failed: 0, lastError: null };
     st.cycleStartedAt = now;
     st.lastClosedAt = now;
     return record;
@@ -518,6 +667,8 @@ class DistributionEngine {
           vhpConsumed: v,
           profit: cmpSats(r, v) > 0 ? subSats(r, v) : "0",
           seenCount: Object.keys(st.seen).length,
+          aiSeenCount: Object.keys(st.aiSeen).length,
+          aiReads: st.aiReads,
         };
       }
       const payoutTotal = st.payouts.reduce((acc, p) => addSats(acc, p.amountSat), "0");
@@ -553,6 +704,8 @@ module.exports = {
   validateDistributionConfig,
   nextCycleClose,
   mergeSeen,
+  mergeAiSeen,
+  selectEligible,
   settleCycle,
   planTick,
 };

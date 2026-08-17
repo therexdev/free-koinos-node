@@ -2416,8 +2416,20 @@ function renderDistributionView() {
         <label class="field"><span class="row" style="gap:8px">
           <input type="checkbox" id="di-enabled" ${cfg.enabled ? "checked" : ""} style="width:auto">
           <b>Enable community distribution</b></span></label>
-        <label class="field"><span>Minimum VHP a node needs to qualify</span>
+        <div class="field">
+          <span>Who earns a share</span>
+          <label class="row" style="gap:8px;margin-top:6px">
+            <input type="checkbox" id="di-req-vhp" ${cfg.requireVhpMinimum ? "checked" : ""} style="width:auto">
+            <span><b>Require VHP minimum</b> <span class="muted small">— must be producing blocks with enough VHP</span></span></label>
+          <label class="row" style="gap:8px;margin-top:6px">
+            <input type="checkbox" id="di-req-ai" ${cfg.requireAiNode ? "checked" : ""} style="width:auto">
+            <span><b>Running Koinos AI Node</b> <span class="muted small">— must be seen on the Koinos AI network</span></span></label>
+          <p class="hint" id="di-rule" style="margin-top:8px"></p>
+        </div>
+        <label class="field" id="di-minvhp-wrap" style="display:${cfg.requireVhpMinimum ? "block" : "none"}"><span>Minimum VHP a node needs to qualify</span>
           <input id="di-minvhp" type="text" class="mono" value="${esc(cfg.minVhpKoin)}"></label>
+        <label class="field" id="di-roster-wrap" style="display:${cfg.requireAiNode ? "block" : "none"}"><span>Koinos AI Node roster URL</span>
+          <input id="di-roster" type="text" class="mono" placeholder="https://…/workers/active" value="${esc(cfg.aiRosterUrl ?? "")}"></label>
         <label class="field"><span>Distribute daily at (UTC hour, 0–23)</span>
           <input id="di-hour" type="number" min="0" max="23" value="${cfg.payoutHourUtc}"></label>
         <div class="grid-2">
@@ -2432,6 +2444,7 @@ function renderDistributionView() {
           <button id="di-close" class="btn">Distribute now</button>
         </div>
         <p class="hint">Every share is equal — a node with ten times the minimum VHP gets the same as one right at it. Your own node counts as one of the eligible nodes and simply keeps its share. If the even share would be below the minimum, the whole pool carries into the next day instead.</p>
+        <p class="hint">With <b>Running Koinos AI Node</b> on, the roster URL decides who is credited — point it only at a roster you trust. If the roster can't be read at any point during a day, that day pays nobody and carries the whole pool over (the VHP reburn still happens).</p>
         <p class="hint">Payouts are signed locally, so the app must be open with the wallet unlocked. Sending and reburning KOIN spend <b>mana</b> — big distributions drain out in chunks as mana recharges. Enabling this turns off the Reward-returns tab (they'd both spend the same rewards).</p>
       </div>
       <div class="card">
@@ -2450,6 +2463,24 @@ function renderDistributionView() {
       <tbody id="di-actions"></tbody></table>
     </div>`;
 
+  const syncGates = () => {
+    const vhp = $("#di-req-vhp").checked;
+    const ai = $("#di-req-ai").checked;
+    $("#di-minvhp-wrap").style.display = vhp ? "block" : "none";
+    $("#di-roster-wrap").style.display = ai ? "block" : "none";
+    $("#di-rule").innerHTML =
+      vhp && ai
+        ? "Both required: a node must be on a Koinos AI Node <b>and</b> producing blocks with the minimum VHP."
+        : vhp
+          ? "Nodes producing blocks that hold at least the minimum VHP earn a share."
+          : ai
+            ? "Every address seen running a Koinos AI Node earns a share, whether or not it produces blocks."
+            : "No requirements — every node seen producing a block earns a share.";
+  };
+  $("#di-req-vhp").addEventListener("change", syncGates);
+  $("#di-req-ai").addEventListener("change", syncGates);
+  syncGates();
+
   $("#di-save").addEventListener("click", onSaveDistribution);
   $("#di-now").addEventListener("click", () => onDistributionTick("distribution:runNow", $("#di-now"), "Checking…"));
   $("#di-close").addEventListener("click", onDistributeNow);
@@ -2462,6 +2493,9 @@ async function onSaveDistribution() {
   try {
     await call("distribution:configure", {
       enabled: $("#di-enabled").checked,
+      requireVhpMinimum: $("#di-req-vhp").checked,
+      requireAiNode: $("#di-req-ai").checked,
+      aiRosterUrl: $("#di-roster").value.trim(),
       minVhpKoin: $("#di-minvhp").value.trim(),
       payoutHourUtc: Number($("#di-hour").value),
       minPayoutKoin: $("#di-minpay").value.trim(),
@@ -2483,7 +2517,8 @@ async function onDistributionTick(channel, btn, busyLabel) {
     patchDistributionView();
     const last = S.distribution.last;
     toast(last?.message || `Check complete: ${last?.outcome ?? "done"}`,
-      ["cycle-closed", "distributed"].includes(last?.outcome) ? "good" : "info", 8000);
+      ["cycle-closed", "distributed"].includes(last?.outcome) ? "good"
+        : last?.outcome === "cycle-held" ? "warn" : "info", 8000);
   } catch (e) {
     toast(e.message, "bad");
   } finally {
@@ -2520,6 +2555,7 @@ const DISTRIBUTION_OUTCOME_LABELS = {
   anchored: ["pill accent", "tracking started"],
   watching: ["pill accent", "watching network"],
   "cycle-closed": ["pill good", "cycle closed"],
+  "cycle-held": ["pill warn", "held — roster unavailable"],
   distributing: ["pill accent", "paying out…"],
   distributed: ["pill good", "all paid out"],
   "tx-error": ["pill bad", "tx failed"],
@@ -2544,8 +2580,27 @@ function patchDistributionView() {
     <div class="row spread"><span class="muted">Next distribution</span>
       <span class="small mono">${c?.dueAt ? fmtTime(c.dueAt) : "—"}</span></div>
     <hr style="border-color:var(--border);border-style:solid;opacity:.4">
+    <div class="row spread"><span class="muted">Requirements</span>
+      <span class="small">${
+        r.config.requireVhpMinimum && r.config.requireAiNode
+          ? `<span class="pill accent">VHP ≥ ${esc(r.config.minVhpKoin)}</span> <span class="pill accent">AI node</span>`
+          : r.config.requireVhpMinimum
+            ? `<span class="pill accent">VHP ≥ ${esc(r.config.minVhpKoin)}</span>`
+            : r.config.requireAiNode
+              ? `<span class="pill accent">AI node</span>`
+              : `<span class="pill">any producer</span>`
+      }</span></div>
     <div class="row spread"><span class="muted">Producers seen this cycle</span>
       <span class="mono">${c ? c.seenCount : "—"}</span></div>
+    ${r.config.requireAiNode
+      ? `<div class="row spread"><span class="muted">AI nodes seen this cycle</span>
+      <span class="mono">${c ? c.aiSeenCount : "—"}${c?.aiReads ? ` <span class="muted small">(${c.aiReads.ok} ok / ${c.aiReads.failed} failed)</span>` : ""}</span></div>
+    ${!r.config.aiRosterUrl
+        ? `<div class="muted small">⚠️ No roster URL set — no one can be verified as running a Koinos AI Node, so cycles will pay nobody and carry over.</div>`
+        : c?.aiReads?.lastError
+          ? `<div class="muted small">⚠️ Last roster read failed: ${esc(c.aiReads.lastError)}</div>`
+          : ""}`
+      : ""}
     <div class="row spread"><span class="muted">Rewards this cycle</span>
       <span class="mono">${c ? fmtSat(c.rewards, 4) : "—"} ${sym()}</span></div>
     <div class="row spread"><span class="muted">VHP consumed (to reburn)</span>
@@ -2563,13 +2618,13 @@ function patchDistributionView() {
   const hist = $("#di-history");
   if (hist) {
     const rows = (d?.history ?? []).map((h) => `<tr>
-        <td class="small">${fmtTime(h.time)}</td>
+        <td class="small">${fmtTime(h.time)}${h.holdReason ? ` <span class="pill warn">held</span>` : ""}</td>
         <td class="mono">${fmtSat(h.pool, 4)}</td>
         <td class="mono">${fmtSat(h.reburn, 4)}</td>
-        <td class="mono">${h.eligibleCount}<span class="muted small"> of ${h.seenCount} seen</span></td>
+        <td class="mono">${h.eligibleCount}<span class="muted small"> of ${h.poolCount ?? h.seenCount} seen</span></td>
         <td class="mono">${fmtSat(h.share, 4)}</td>
         <td class="mono">${fmtSat(h.carryOut, 4)}</td>
-      </tr>`);
+      </tr>${h.holdReason ? `<tr><td colspan="6" class="muted small">${esc(h.holdReason)}</td></tr>` : ""}`);
     hist.innerHTML = rows.join("") || `<tr><td colspan="6" class="muted">No distributions yet.</td></tr>`;
   }
 

@@ -7,6 +7,8 @@ const {
   validateDistributionConfig,
   nextCycleClose,
   mergeSeen,
+  mergeAiSeen,
+  selectEligible,
   settleCycle,
   planTick,
 } = require("../electron/lib/distribution");
@@ -17,11 +19,21 @@ const KOIN = (n) => String(BigInt(n) * 100000000n);
 
 test("validateDistributionConfig normalizes and rejects bad values", () => {
   const cfg = validateDistributionConfig({
-    enabled: 1, minVhpKoin: "10000", payoutHourUtc: "3", minPayoutKoin: "0.5", pollMinutes: "15",
+    enabled: 1, requireVhpMinimum: 1, requireAiNode: 0, aiRosterUrl: "",
+    minVhpKoin: "10000", payoutHourUtc: "3", minPayoutKoin: "0.5", pollMinutes: "15",
   });
   assert.deepEqual(cfg, {
-    enabled: true, minVhpKoin: "10000", payoutHourUtc: 3, minPayoutKoin: "0.5", pollMinutes: 15,
+    enabled: true, requireVhpMinimum: true, requireAiNode: false, aiRosterUrl: "",
+    minVhpKoin: "10000", payoutHourUtc: 3, minPayoutKoin: "0.5", pollMinutes: 15,
   });
+  // A blank roster URL stays allowed with the AI gate on (the engine fails
+  // closed at settlement instead), but a malformed one is rejected on save.
+  assert.equal(
+    validateDistributionConfig({ requireAiNode: true, aiRosterUrl: "", minVhpKoin: "1", payoutHourUtc: 0, minPayoutKoin: "1", pollMinutes: 10 }).aiRosterUrl,
+    ""
+  );
+  assert.throws(() => validateDistributionConfig({ aiRosterUrl: "not a url", minVhpKoin: "1", payoutHourUtc: 0, minPayoutKoin: "1", pollMinutes: 10 }), /valid URL|https/);
+  assert.throws(() => validateDistributionConfig({ aiRosterUrl: "http://evil.example/roster", minVhpKoin: "1", payoutHourUtc: 0, minPayoutKoin: "1", pollMinutes: 10 }), /https/);
   assert.throws(() => validateDistributionConfig({ minVhpKoin: "0", payoutHourUtc: 0, minPayoutKoin: "1", pollMinutes: 10 }), /Minimum VHP/);
   assert.throws(() => validateDistributionConfig({ minVhpKoin: "x", payoutHourUtc: 0, minPayoutKoin: "1", pollMinutes: 10 }), /Invalid amount/);
   assert.throws(() => validateDistributionConfig({ minVhpKoin: "10000", payoutHourUtc: 24, minPayoutKoin: "1", pollMinutes: 10 }), /hour/);
@@ -58,6 +70,70 @@ test("mergeSeen accumulates blocks per signer and tracks last-seen", () => {
   assert.equal(seen.A.lastSeenMs, 1006);
   assert.equal(seen.B.blocks, 1);
   assert.equal(Object.keys(seen).length, 2);
+});
+
+test("mergeAiSeen records every address the roster reported", () => {
+  const ai = {};
+  mergeAiSeen(ai, ["A", "B"], 1000);
+  mergeAiSeen(ai, ["A"], 2000);
+  assert.equal(ai.A.reads, 2);
+  assert.equal(ai.A.lastSeenMs, 2000);
+  assert.equal(ai.B.reads, 1);
+});
+
+// ---------- the eligibility matrix (the two checkboxes) ----------
+
+// Four candidates covering every interesting combination of signals.
+const CANDIDATES = [
+  { address: "produces-rich",  producing: true,  aiNode: false, vhpSat: KOIN(50000) },
+  { address: "produces-poor",  producing: true,  aiNode: false, vhpSat: KOIN(500) },
+  { address: "ai-and-mines",   producing: true,  aiNode: true,  vhpSat: KOIN(10000) },
+  { address: "ai-only",        producing: false, aiNode: true,  vhpSat: "0" },
+];
+const matrix = (requireVhpMinimum, requireAiNode) =>
+  selectEligible({ candidates: CANDIDATES, requireVhpMinimum, requireAiNode, minVhpSat: KOIN(10000) }).eligible;
+
+test("neither box: every node seen producing earns a share", () => {
+  assert.deepEqual(matrix(false, false), ["produces-rich", "produces-poor", "ai-and-mines"]);
+});
+
+test("VHP only: producing nodes at or above the minimum", () => {
+  // "produces-poor" is below the 10k line; "ai-only" never produced a block.
+  assert.deepEqual(matrix(true, false), ["produces-rich", "ai-and-mines"]);
+});
+
+test("AI only: anyone seen on an AI node, block production irrelevant", () => {
+  assert.deepEqual(matrix(false, true), ["ai-and-mines", "ai-only"]);
+});
+
+test("both boxes: must be on an AI node AND mining with the minimum VHP", () => {
+  assert.deepEqual(matrix(true, true), ["ai-and-mines"]);
+});
+
+test("exactly at the minimum VHP qualifies (>=, not >)", () => {
+  const { eligible } = selectEligible({
+    candidates: [{ address: "edge", producing: true, aiNode: true, vhpSat: KOIN(10000) }],
+    requireVhpMinimum: true, requireAiNode: false, minVhpSat: KOIN(10000),
+  });
+  assert.deepEqual(eligible, ["edge"]);
+});
+
+test("an unreadable VHP balance is never assumed to qualify", () => {
+  const { eligible, rejected } = selectEligible({
+    candidates: [{ address: "unknown", producing: true, aiNode: true, vhpSat: null }],
+    requireVhpMinimum: true, requireAiNode: false, minVhpSat: KOIN(10000),
+  });
+  assert.deepEqual(eligible, []);
+  assert.equal(rejected.vhpUnknown, 1);
+});
+
+test("rejection reasons are tallied for the UI", () => {
+  const { rejected } = selectEligible({
+    candidates: CANDIDATES, requireVhpMinimum: true, requireAiNode: true, minVhpSat: KOIN(10000),
+  });
+  assert.equal(rejected.notProducing, 1); // ai-only
+  assert.equal(rejected.belowVhp, 1);     // produces-poor
+  assert.equal(rejected.notAiNode, 1);    // produces-rich
 });
 
 // ---------- cycle settlement ----------
@@ -222,11 +298,21 @@ class MemStore {
 
 const SELF = "1SelfProducerAddressXXXXXXXXXXXXXX";
 
-function makeWorld({ totals, headers, vhp, balances }) {
+function makeWorld({ totals, headers, vhp, balances, cfg = {}, roster = null }) {
   const settings = new MemStore({
     network: "mainnet",
     keepLiquidKoin: "10",
-    distribution: { enabled: true, minVhpKoin: "10000", payoutHourUtc: 0, minPayoutKoin: "0.5", pollMinutes: 10 },
+    distribution: {
+      enabled: true,
+      requireVhpMinimum: true,
+      requireAiNode: false,
+      aiRosterUrl: "",
+      minVhpKoin: "10000",
+      payoutHourUtc: 0,
+      minPayoutKoin: "0.5",
+      pollMinutes: 10,
+      ...cfg,
+    },
   });
   const state = new MemStore();
   const calls = { burns: [], transfers: [] };
@@ -255,6 +341,12 @@ function makeWorld({ totals, headers, vhp, balances }) {
     get: () => ({ totals: totals.current }),
   };
   const engine = new DistributionEngine({ chain, wallet, settings, state, stats, onEvent: () => {} });
+  // Stand in for the network call to the Koinos AI Node roster: `roster` is
+  // either an array of addresses or a function that may throw.
+  if (roster) {
+    const rosterFn = typeof roster === "function" ? roster : () => roster;
+    engine._fetchRoster = async () => ({ addresses: rosterFn() });
+  }
   return { engine, calls, settings, state, totals };
 }
 
@@ -376,6 +468,115 @@ test("engine: disabled means dormant — behaves like a normal node", async () =
   assert.equal(res.last.outcome, "disabled");
   assert.equal(world.calls.burns.length, 0);
   assert.equal(world.calls.transfers.length, 0);
+});
+
+test("engine (AI only): pays an AI node that never produced a block", async () => {
+  const totals = { current: { rewards: KOIN(0), vhpConsumed: KOIN(0), blocks: 0 } };
+  const world = makeWorld({
+    totals,
+    headers: [{ height: 1000, timestamp: 3, signer: A }], // only A produces
+    vhp: { [A]: KOIN(10000), [B]: "0" },
+    balances: { koin: KOIN(500), vhp: KOIN(15000), mana: KOIN(400) },
+    cfg: { requireVhpMinimum: false, requireAiNode: true, aiRosterUrl: "https://kai.example/workers" },
+    roster: [B], // B serves AI but has no VHP and produces nothing
+  });
+  await world.engine.tick("manual");
+  totals.current = { rewards: KOIN(110), vhpConsumed: KOIN(100), blocks: 10 };
+
+  const res = await world.engine.tick("manual", { forceClose: true });
+  assert.equal(res.last.outcome, "cycle-closed");
+  // Only B qualifies — the AI gate ignores block production and VHP entirely.
+  assert.equal(res.derived.lastDistribution.eligibleCount, 1);
+  assert.equal(world.calls.transfers.length, 1);
+  assert.equal(world.calls.transfers[0].to, B);
+  assert.equal(world.calls.transfers[0].amountSat, KOIN(10));
+  assert.deepEqual(world.calls.burns, [KOIN(100)]); // VHP restored either way
+});
+
+test("engine (both gates): only an AI node that also mines with the VHP is paid", async () => {
+  const totals = { current: { rewards: KOIN(0), vhpConsumed: KOIN(0), blocks: 0 } };
+  const world = makeWorld({
+    totals,
+    headers: [
+      { height: 999, timestamp: 2, signer: A }, // mines, 10k VHP, on AI  -> pays
+      { height: 1000, timestamp: 3, signer: C }, // mines, 10k VHP, no AI -> no
+    ],
+    vhp: { [A]: KOIN(10000), [B]: KOIN(999999), [C]: KOIN(10000) },
+    balances: { koin: KOIN(500), vhp: KOIN(15000), mana: KOIN(400) },
+    cfg: { requireVhpMinimum: true, requireAiNode: true, aiRosterUrl: "https://kai.example/workers" },
+    roster: [A, B], // B is on AI but produces no blocks -> no
+  });
+  await world.engine.tick("manual");
+  totals.current = { rewards: KOIN(110), vhpConsumed: KOIN(100), blocks: 10 };
+
+  const res = await world.engine.tick("manual", { forceClose: true });
+  assert.equal(res.derived.lastDistribution.eligibleCount, 1);
+  assert.equal(world.calls.transfers.length, 1);
+  assert.equal(world.calls.transfers[0].to, A);
+});
+
+test("engine (AI gate): a roster that never answers pays nobody and carries the pool", async () => {
+  const totals = { current: { rewards: KOIN(0), vhpConsumed: KOIN(0), blocks: 0 } };
+  const world = makeWorld({
+    totals,
+    headers: [{ height: 1000, timestamp: 3, signer: A }],
+    vhp: { [A]: KOIN(10000) },
+    balances: { koin: KOIN(500), vhp: KOIN(15000), mana: KOIN(400) },
+    cfg: { requireVhpMinimum: false, requireAiNode: true, aiRosterUrl: "https://kai.example/workers" },
+    roster: () => { throw new Error("roster offline"); },
+  });
+  await world.engine.tick("manual");
+  totals.current = { rewards: KOIN(110), vhpConsumed: KOIN(100), blocks: 10 };
+
+  const res = await world.engine.tick("manual", { forceClose: true });
+  assert.equal(res.last.outcome, "cycle-held");
+  assert.equal(world.calls.transfers.length, 0);        // nobody guessed at
+  assert.deepEqual(world.calls.burns, [KOIN(100)]);      // VHP still restored
+  assert.equal(res.derived.carry, KOIN(10));             // profit carried whole
+  assert.match(res.derived.lastDistribution.holdReason, /roster offline/);
+});
+
+test("engine (AI gate): no roster URL configured also fails closed", async () => {
+  const totals = { current: { rewards: KOIN(0), vhpConsumed: KOIN(0), blocks: 0 } };
+  const world = makeWorld({
+    totals,
+    headers: [{ height: 1000, timestamp: 3, signer: A }],
+    vhp: { [A]: KOIN(10000) },
+    balances: { koin: KOIN(500), vhp: KOIN(15000), mana: KOIN(400) },
+    cfg: { requireVhpMinimum: true, requireAiNode: true, aiRosterUrl: "" },
+  });
+  await world.engine.tick("manual");
+  totals.current = { rewards: KOIN(110), vhpConsumed: KOIN(100), blocks: 10 };
+
+  const res = await world.engine.tick("manual", { forceClose: true });
+  assert.equal(res.last.outcome, "cycle-held");
+  assert.equal(world.calls.transfers.length, 0);
+  assert.equal(res.derived.carry, KOIN(10));
+});
+
+test("engine (no gates): every producer seen is paid, VHP never fetched", async () => {
+  const totals = { current: { rewards: KOIN(0), vhpConsumed: KOIN(0), blocks: 0 } };
+  let vhpLookups = 0;
+  const world = makeWorld({
+    totals,
+    headers: [
+      { height: 999, timestamp: 2, signer: A },
+      { height: 1000, timestamp: 3, signer: C }, // tiny VHP, still paid
+    ],
+    vhp: { [A]: KOIN(10000), [C]: "1" },
+    balances: { koin: KOIN(500), vhp: KOIN(15000), mana: KOIN(400) },
+    cfg: { requireVhpMinimum: false, requireAiNode: false },
+  });
+  const realVhp = world.engine.chain.vhpBalances;
+  world.engine.chain.vhpBalances = async (...a) => { vhpLookups += 1; return realVhp(...a); };
+
+  await world.engine.tick("manual");
+  totals.current = { rewards: KOIN(110), vhpConsumed: KOIN(100), blocks: 10 };
+  const res = await world.engine.tick("manual", { forceClose: true });
+
+  assert.equal(res.derived.lastDistribution.eligibleCount, 2);
+  assert.equal(world.calls.transfers.length, 2);
+  assert.equal(vhpLookups, 0); // gate off -> the balance round-trip is skipped
 });
 
 test("engine: a failed payout stays queued and is retried", async () => {

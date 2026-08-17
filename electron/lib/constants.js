@@ -140,12 +140,18 @@ const DEFAULT_SETTINGS = {
   // between every node seen producing on the network with at least minVhpKoin
   // VHP. Off by default — disabled, the app behaves exactly like Koinos Node
   // Desktop (keep/compound your own rewards via the Reward-returns tab).
+  // Two independent eligibility gates decide who shares in the pool. Neither
+  // gate on = every node seen producing qualifies; both on = a node must
+  // satisfy both. See selectEligible() in distribution.js.
   distribution: {
     enabled: false,
-    minVhpKoin: "10000",  // a node qualifies with at least this much VHP
-    payoutHourUtc: 0,     // close the daily cycle at this UTC hour
-    minPayoutKoin: "0.5", // skip a cycle when the even share would be below this
-    pollMinutes: 10,      // engine check interval (snapshots + queue draining)
+    requireVhpMinimum: true,  // gate 1: producing AND holding >= minVhpKoin
+    requireAiNode: false,     // gate 2: seen running a Koinos AI Node
+    minVhpKoin: "10000",      // a node qualifies with at least this much VHP
+    aiRosterUrl: "",          // where the live Koinos AI Node roster is read
+    payoutHourUtc: 0,         // close the daily cycle at this UTC hour
+    minPayoutKoin: "0.5",     // skip a cycle when the even share would be below this
+    pollMinutes: 10,          // engine check interval (snapshots + queue draining)
   },
   keepLiquidKoin: "10",   // liquid KOIN kept as a balance buffer for mana
 };

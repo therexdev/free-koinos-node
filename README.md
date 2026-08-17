@@ -27,12 +27,11 @@ With **Community distribution** enabled (Distribution tab):
    - The **VHP consumed** by your production that day is queued to be
      **re-burned** (KOIN → VHP), so your node's VHP ends the day level and it
      keeps producing at the same rate.
-   - The **profit** is split **evenly** between every producer seen that day
-     whose VHP balance is at least the threshold (default **10,000 VHP**, a
-     setting). Even means even — a node with 1,000,000 VHP gets the same share
-     as a node with 10,000. 100 KOIN of profit across 10 qualifying nodes is
-     10 KOIN each. Your own node counts as one of them and simply keeps its
-     share.
+   - The **profit** is split **evenly** between every node that met the
+     eligibility requirements (below). Even means even — a node with 1,000,000
+     VHP gets the same share as a node with 10,000. 100 KOIN of profit across
+     10 qualifying nodes is 10 KOIN each. Your own node counts as one of them
+     and simply keeps its share.
 3. **Paced payouts.** Reburns and payouts go into a queue that drains over the
    following hours, automatically capped to the mana available at each check
    (burning and sending KOIN each spend mana 1:1 on-chain). Nothing is lost if
@@ -42,6 +41,39 @@ With **Community distribution** enabled (Distribution tab):
 If the even share would be smaller than the minimum payout (a setting), nothing
 is sent that day and the whole pool carries into the next day's pot. Integer
 division remainders carry over too — satoshis are never dropped.
+
+### Who qualifies — two independent requirements
+
+Eligibility is controlled by two checkboxes that can be used alone, together,
+or not at all:
+
+| Require VHP minimum | Running Koinos AI Node | Who earns a share |
+| :---: | :---: | --- |
+| ☐ | ☐ | Every node seen producing a block that day |
+| ☑ | ☐ | Nodes producing blocks that hold at least the minimum VHP (default 10,000) |
+| ☐ | ☑ | Every address seen running a Koinos AI Node, whether or not it produces blocks |
+| ☑ | ☑ | Both: must be on a Koinos AI Node **and** producing blocks with the minimum VHP |
+
+Block production is required in every combination except *AI only* — that mode
+deliberately credits AI-node operators who aren't block producers at all.
+A node whose VHP balance can't be read is never assumed to qualify.
+
+**Verifying "Running Koinos AI Node."** The app reads a **roster URL** — an
+endpoint listing the addresses currently serving on the Koinos AI network — and
+snapshots it on the same schedule as block producers, so an address counts if it
+was seen on the roster at any point during the day. The URL must be `https://`
+(or `http://` on 127.0.0.1 for a scheduler running beside the app), responses are
+size-capped, and every entry is checksum-validated before it can be paid.
+
+> The roster decides who gets paid. Point it only at a roster you trust — whoever
+> controls that endpoint can nominate payees (though never more than the day's
+> profit, and never past the VHP gate when that is also on).
+
+**It fails closed.** If the AI requirement is on and the roster could not be read
+even once during a day — no URL set, endpoint down, bad response — that day pays
+**nobody** and carries the entire pool into the next day. The VHP reburn still
+happens, so your node's production is never affected. The cycle is recorded as
+*held* with the reason, so an empty distribution is never a silent mystery.
 
 **Turn it off and the app behaves exactly like Koinos Node Desktop**: you keep
 your rewards, and the Reward-returns tab can compound them back into VHP for
@@ -58,7 +90,10 @@ never distributed.
 | Setting | Default | Meaning |
 | --- | --- | --- |
 | Enable community distribution | off | Off = behave like a normal node |
+| Require VHP minimum | on | Gate 1: must be producing blocks with enough VHP |
+| Running Koinos AI Node | off | Gate 2: must be seen on the Koinos AI network |
 | Minimum VHP to qualify | 10,000 | A producer must hold at least this much VHP to receive a share |
+| Koinos AI Node roster URL | *(unset)* | Where the live AI-node roster is read (required by gate 2) |
 | Distribute daily at | 0 (UTC) | Hour of day the cycle closes and payouts are queued |
 | Minimum share to pay out | 0.5 KOIN | Below this the day's pool carries to the next day |
 | Check every | 10 min | Snapshot + queue-draining interval |
