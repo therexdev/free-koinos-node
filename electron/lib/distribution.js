@@ -301,7 +301,11 @@ class DistributionEngine {
       lastScannedHeight: null, // network snapshot progress
       seen: {},                // { [producer]: { blocks, lastSeenHeight, lastSeenMs } }
       aiSeen: {},              // { [address]: { reads, firstSeenMs, lastSeenMs } }
-      aiReads: { ok: 0, failed: 0, lastError: null }, // roster reads this cycle
+      // Roster reads this cycle. `accepted`/`rejected` count addresses, not
+      // reads: a roster that answers happily but only ever returns unusable
+      // addresses (a display endpoint that truncates them, say) must be
+      // distinguishable from one that genuinely has no workers online.
+      aiReads: { ok: 0, failed: 0, accepted: 0, rejected: 0, lastError: null },
       carry: "0",              // undistributed profit carried between cycles
       reburnOwed: "0",         // KOIN still to burn back into VHP
       payouts: [],             // [{ address, amountSat }] waiting to be sent
@@ -310,7 +314,9 @@ class DistributionEngine {
     };
     st.seen ??= {};
     st.aiSeen ??= {};
-    st.aiReads ??= { ok: 0, failed: 0, lastError: null };
+    st.aiReads ??= { ok: 0, failed: 0, accepted: 0, rejected: 0, lastError: null };
+    st.aiReads.accepted ??= 0;
+    st.aiReads.rejected ??= 0;
     st.payouts ??= [];
     st.history ??= [];
     st.actions ??= [];
@@ -413,7 +419,12 @@ class DistributionEngine {
           const roster = await this._fetchRoster(cfg.aiRosterUrl);
           mergeAiSeen(st.aiSeen, roster.addresses, now);
           st.aiReads.ok += 1;
-          st.aiReads.lastError = null;
+          st.aiReads.accepted += roster.addresses.length;
+          st.aiReads.rejected += roster.rejected ?? 0;
+          st.aiReads.lastError =
+            roster.addresses.length === 0 && roster.rejected > 0
+              ? `Roster answered but all ${roster.rejected} addresses were unusable — is this a display endpoint that shortens addresses?`
+              : null;
         } catch (e) {
           rosterError = String(e.message);
           st.aiReads.failed += 1;
@@ -516,10 +527,16 @@ class DistributionEngine {
       balances = await this.chain.vhpBalances(poolAddresses);
     }
 
-    // Fail closed: with the AI gate on, a cycle where the roster never answered
-    // cannot tell who qualifies. Reburn still happens (the node's VHP must stay
-    // level either way) but nobody is paid and the whole pool carries forward.
-    const aiUnavailable = cfg.requireAiNode && st.aiReads.ok === 0;
+    // Fail closed: with the AI gate on, a cycle that never learned who is on the
+    // AI network cannot tell who qualifies. That covers two different failures —
+    // the roster never answered, and the roster answered but every address it
+    // gave was unusable (the giveaway for pointing at a status page that
+    // shortens addresses for display). Reburn still happens either way, since
+    // the node's VHP must stay level; nobody is paid and the pool carries.
+    const rosterNeverAnswered = cfg.requireAiNode && st.aiReads.ok === 0;
+    const rosterAllUnusable =
+      cfg.requireAiNode && st.aiReads.ok > 0 && st.aiReads.accepted === 0 && st.aiReads.rejected > 0;
+    const aiUnavailable = rosterNeverAnswered || rosterAllUnusable;
     let eligible = [];
     let rejected = { notProducing: 0, belowVhp: 0, vhpUnknown: 0, notAiNode: 0 };
     if (!aiUnavailable) {
@@ -573,9 +590,11 @@ class DistributionEngine {
       },
       // Set when the AI roster never answered this cycle — explains a payout of
       // nobody, so an empty distribution is never a silent mystery.
-      holdReason: aiUnavailable
-        ? `Koinos AI Node roster unavailable all cycle (${st.aiReads.lastError ?? "no successful read"}) — nobody was paid and the pool carried over.`
-        : null,
+      holdReason: rosterAllUnusable
+        ? `The AI node roster answered, but none of the ${st.aiReads.rejected} addresses it returned were valid Koinos addresses — a status/display endpoint that shortens addresses can't be paid to. Nobody was paid and the pool carried over.`
+        : rosterNeverAnswered
+          ? `Koinos AI Node roster unavailable all cycle (${st.aiReads.lastError ?? "no successful read"}) — nobody was paid and the pool carried over.`
+          : null,
     };
     st.history.unshift(record);
     st.history = st.history.slice(0, HISTORY_KEEP);
@@ -584,7 +603,7 @@ class DistributionEngine {
     st.anchor = { rewards: statsRes.totals.rewards, vhpConsumed: statsRes.totals.vhpConsumed };
     st.seen = {};
     st.aiSeen = {};
-    st.aiReads = { ok: 0, failed: 0, lastError: null };
+    st.aiReads = { ok: 0, failed: 0, accepted: 0, rejected: 0, lastError: null };
     st.cycleStartedAt = now;
     st.lastClosedAt = now;
     return record;

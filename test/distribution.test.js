@@ -536,6 +536,53 @@ test("engine (AI gate): a roster that never answers pays nobody and carries the 
   assert.match(res.derived.lastDistribution.holdReason, /roster offline/);
 });
 
+test("engine (AI gate): a roster of truncated display addresses is held, not silently empty", async () => {
+  // The exact trap: pointing at a status page that shortens addresses for
+  // display. Every read succeeds, so this is NOT the "roster offline" path —
+  // it must still be caught and explained rather than closing as a normal
+  // cycle that happened to pay nobody.
+  const totals = { current: { rewards: KOIN(0), vhpConsumed: KOIN(0), blocks: 0 } };
+  const world = makeWorld({
+    totals,
+    headers: [{ height: 1000, timestamp: 3, signer: A }],
+    vhp: { [A]: KOIN(10000) },
+    balances: { koin: KOIN(500), vhp: KOIN(15000), mana: KOIN(400) },
+    cfg: { requireVhpMinimum: false, requireAiNode: true, aiRosterUrl: "https://koinosai.example/status" },
+  });
+  // A successful read that yielded no usable addresses: 10 rejected, 0 kept.
+  world.engine._fetchRoster = async () => ({ addresses: [], rejected: 10 });
+
+  await world.engine.tick("manual");
+  totals.current = { rewards: KOIN(110), vhpConsumed: KOIN(100), blocks: 10 };
+
+  const res = await world.engine.tick("manual", { forceClose: true });
+  assert.equal(res.last.outcome, "cycle-held");
+  assert.equal(world.calls.transfers.length, 0);
+  assert.deepEqual(world.calls.burns, [KOIN(100)]); // VHP still restored
+  assert.equal(res.derived.carry, KOIN(10));
+  assert.match(res.derived.lastDistribution.holdReason, /none of the 10 addresses/);
+});
+
+test("engine (AI gate): a roster with some bad entries still pays the good ones", async () => {
+  const totals = { current: { rewards: KOIN(0), vhpConsumed: KOIN(0), blocks: 0 } };
+  const world = makeWorld({
+    totals,
+    headers: [{ height: 1000, timestamp: 3, signer: A }],
+    vhp: { [A]: KOIN(10000) },
+    balances: { koin: KOIN(500), vhp: KOIN(15000), mana: KOIN(400) },
+    cfg: { requireVhpMinimum: false, requireAiNode: true, aiRosterUrl: "https://kai.example/roster" },
+  });
+  world.engine._fetchRoster = async () => ({ addresses: [A], rejected: 3 });
+
+  await world.engine.tick("manual");
+  totals.current = { rewards: KOIN(110), vhpConsumed: KOIN(100), blocks: 10 };
+
+  const res = await world.engine.tick("manual", { forceClose: true });
+  assert.equal(res.last.outcome, "cycle-closed"); // not held — one address was usable
+  assert.equal(world.calls.transfers.length, 1);
+  assert.equal(world.calls.transfers[0].to, A);
+});
+
 test("engine (AI gate): no roster URL configured also fails closed", async () => {
   const totals = { current: { rewards: KOIN(0), vhpConsumed: KOIN(0), blocks: 0 } };
   const world = makeWorld({

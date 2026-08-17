@@ -2597,9 +2597,13 @@ function patchDistributionView() {
       <span class="mono">${c ? c.aiSeenCount : "—"}${c?.aiReads ? ` <span class="muted small">(${c.aiReads.ok} ok / ${c.aiReads.failed} failed)</span>` : ""}</span></div>
     ${!r.config.aiRosterUrl
         ? `<div class="muted small">⚠️ No roster URL set — no one can be verified as running a Koinos AI Node, so cycles will pay nobody and carry over.</div>`
-        : c?.aiReads?.lastError
-          ? `<div class="muted small">⚠️ Last roster read failed: ${esc(c.aiReads.lastError)}</div>`
-          : ""}`
+        : c?.aiReads?.accepted === 0 && c?.aiReads?.rejected > 0
+          ? `<div class="muted small">⚠️ The roster answered, but none of the ${c.aiReads.rejected} addresses it returned were valid Koinos addresses. A status/display page that shortens addresses (<span class="mono">1AbCdE…wXyZ</span>) can't be paid to — point this at an endpoint that returns full addresses.</div>`
+          : c?.aiReads?.lastError
+            ? `<div class="muted small">⚠️ Last roster read failed: ${esc(c.aiReads.lastError)}</div>`
+            : c?.aiReads?.rejected > 0
+              ? `<div class="muted small">⚠️ ${c.aiReads.rejected} roster ${c.aiReads.rejected === 1 ? "entry was" : "entries were"} not a valid Koinos address and ${c.aiReads.rejected === 1 ? "was" : "were"} ignored.</div>`
+              : ""}`
       : ""}
     <div class="row spread"><span class="muted">Rewards this cycle</span>
       <span class="mono">${c ? fmtSat(c.rewards, 4) : "—"} ${sym()}</span></div>
