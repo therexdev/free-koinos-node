@@ -1,0 +1,7 @@
+# runtime dirs + assets fetched from local-koinos via `npm pack` (see README)
+core/
+p1/
+p2/
+config/
+package/
+*.tgz

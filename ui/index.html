@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta
+    http-equiv="Content-Security-Policy"
+    content="default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; base-uri 'none'"
+  />
+  <title>Free Koinos Node</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div id="app">
+    <aside id="sidebar">
+      <div class="brand">
+        <div class="brand-mark">⬢</div>
+        <div>
+          <div class="brand-name">Free Koinos</div>
+          <div class="brand-sub">Node</div>
+        </div>
+      </div>
+      <nav id="nav">
+        <button class="nav-item active" data-view="dashboard">📊 Dashboard</button>
+        <button class="nav-item" data-view="wallet">💳 Wallet</button>
+        <button class="nav-item" data-view="fund">💵 Fund node</button>
+        <button class="nav-item" data-view="burn">🔥 Burn KOIN → VHP</button>
+        <button class="nav-item" data-view="node">🖥️ Node</button>
+        <button class="nav-item" data-view="distribution">🌍 Distribution</button>
+        <button class="nav-item" data-view="returns">♻️ Reward returns</button>
+        <button class="nav-item" data-view="settings">⚙️ Settings</button>
+      </nav>
+      <div class="sidebar-foot">
+        <span id="network-pill" class="pill">mainnet</span>
+        <span id="version-tag" class="muted"></span>
+      </div>
+    </aside>
+    <main id="main">
+      <section id="view-dashboard" class="view active"></section>
+      <section id="view-wallet" class="view"></section>
+      <section id="view-fund" class="view"></section>
+      <section id="view-burn" class="view"></section>
+      <section id="view-node" class="view"></section>
+      <section id="view-distribution" class="view"></section>
+      <section id="view-returns" class="view"></section>
+      <section id="view-settings" class="view"></section>
+    </main>
+  </div>
+  <div id="toasts"></div>
+  <div id="modal-root"></div>
+  <script src="renderer.js"></script>
+</body>
+</html>

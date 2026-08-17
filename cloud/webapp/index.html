@@ -1,0 +1,153 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<meta name="theme-color" content="#0b0e14" />
+<link rel="manifest" href="manifest.webmanifest" />
+<title>Koinos Cloud Node</title>
+<style>
+  :root {
+    --bg: #0b0e14; --card: #151a24; --card2: #1b2230; --line: #263041;
+    --fg: #e7edf6; --muted: #93a1b5; --accent: #4f8cff; --accent2: #2fbf71;
+    --danger: #ff5c5c; --warn: #f5a623; --radius: 14px;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    padding: env(safe-area-inset-top) 0 calc(env(safe-area-inset-bottom) + 24px);
+  }
+  header { padding: 20px 16px 8px; }
+  header h1 { margin: 0; font-size: 20px; letter-spacing: .2px; }
+  header p { margin: 4px 0 0; color: var(--muted); font-size: 13px; }
+  .free { display:inline-block; margin-top:8px; padding:2px 8px; border-radius:999px; background:rgba(47,191,113,.15); color:var(--accent2); font-size:12px; font-weight:600; }
+  main { max-width: 560px; margin: 0 auto; padding: 8px 16px; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: var(--radius); padding: 16px; margin: 12px 0; }
+  .card h2 { margin: 0 0 12px; font-size: 15px; display:flex; align-items:center; gap:8px; }
+  .card h2 .dot { width:8px; height:8px; border-radius:50%; background:var(--muted); }
+  .card h2 .dot.ok { background:var(--accent2); } .card h2 .dot.bad { background:var(--danger); } .card h2 .dot.warn{ background:var(--warn); }
+  label { display:block; font-size:12px; color: var(--muted); margin: 10px 0 4px; }
+  input, textarea, select {
+    width: 100%; background: var(--card2); color: var(--fg); border: 1px solid var(--line);
+    border-radius: 10px; padding: 10px 12px; font-size: 14px; font-family: inherit;
+  }
+  textarea { resize: vertical; min-height: 60px; word-break: break-all; }
+  .row { display:flex; gap:8px; flex-wrap: wrap; }
+  .row > * { flex: 1; min-width: 0; }
+  button {
+    appearance: none; border: 0; border-radius: 10px; padding: 11px 14px; font-size: 14px; font-weight: 600;
+    color: #fff; background: var(--accent); cursor: pointer; margin-top: 10px;
+  }
+  button.secondary { background: var(--card2); color: var(--fg); border: 1px solid var(--line); }
+  button.green { background: var(--accent2); } button.danger { background: var(--danger); }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12.5px; word-break: break-all; }
+  .kv { display:flex; justify-content:space-between; gap:10px; padding:6px 0; border-bottom:1px dashed var(--line); }
+  .kv:last-child { border-bottom:0; }
+  .kv .k { color: var(--muted); } .kv .v { text-align:right; }
+  .muted { color: var(--muted); } .small { font-size:12px; } .hide { display:none !important; }
+  .pill { padding:2px 8px; border-radius:999px; font-size:12px; font-weight:600; }
+  .pill.on { background:rgba(47,191,113,.15); color:var(--accent2); } .pill.off{ background:rgba(255,92,92,.15); color:var(--danger);} .pill.wait{background:rgba(245,166,35,.15);color:var(--warn);}
+  details summary { cursor:pointer; color:var(--muted); font-size:13px; }
+  #toast { position: fixed; left: 50%; bottom: 20px; transform: translateX(-50%); background:#000; border:1px solid var(--line); color:#fff; padding:10px 14px; border-radius:10px; font-size:13px; max-width:90%; opacity:0; transition:opacity .2s; pointer-events:none; z-index:50; }
+  #toast.show { opacity: 1; }
+  .warnbox { background: rgba(245,166,35,.1); border:1px solid rgba(245,166,35,.3); color:#ffd98a; padding:10px 12px; border-radius:10px; font-size:12.5px; }
+  a { color: var(--accent); }
+</style>
+</head>
+<body>
+<header>
+  <h1>⛏️ Koinos Cloud Node</h1>
+  <p>Run your own block producer in the cloud — your key, your vote, 100% of rewards.</p>
+  <span class="free">Free while testing</span>
+</header>
+
+<main>
+  <!-- Connection -->
+  <section class="card">
+    <details id="connDetails">
+      <summary>Connection settings</summary>
+      <label>Core-agent URL</label>
+      <input id="agentUrl" placeholder="http://your-core-host:3738" />
+      <label>Agent token</label>
+      <input id="agentToken" type="password" placeholder="x-agent-token secret" />
+      <label>Koinos RPC URL</label>
+      <input id="rpcUrl" placeholder="https://api.koinos.io" />
+      <button id="saveConn" class="secondary">Save</button>
+      <span id="connState" class="small muted"></span>
+    </details>
+  </section>
+
+  <!-- Wallet -->
+  <section class="card" id="walletCard">
+    <h2><span class="dot" id="walletDot"></span> Wallet</h2>
+    <div id="walletNone">
+      <p class="muted small">Your main key stays in this browser. It holds KOIN/VHP, registers your node's
+      signing key, votes, and receives 100% of rewards. (Testing: keys are stored in this browser.)</p>
+      <div class="row">
+        <button id="genWallet" class="green">Generate new wallet</button>
+        <button id="showImport" class="secondary">Import WIF</button>
+      </div>
+      <div id="importBox" class="hide">
+        <label>Private key (WIF)</label>
+        <textarea id="wifIn" placeholder="5J… or K/L…"></textarea>
+        <button id="importWallet">Import</button>
+      </div>
+    </div>
+    <div id="walletInfo" class="hide">
+      <div class="kv"><span class="k">Address</span><span class="v mono" id="wAddr"></span></div>
+      <div class="kv"><span class="k">KOIN</span><span class="v" id="wKoin">—</span></div>
+      <div class="kv"><span class="k">VHP</span><span class="v" id="wVhp">—</span></div>
+      <div class="kv"><span class="k">Mana</span><span class="v" id="wMana">—</span></div>
+      <div class="row">
+        <button id="refreshBal" class="secondary">Refresh</button>
+        <button id="exportWif" class="secondary">Export WIF</button>
+        <button id="forgetWallet" class="danger">Forget</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- Node -->
+  <section class="card" id="nodeCard">
+    <h2><span class="dot" id="nodeDot"></span> Your node</h2>
+    <div id="nodeNone">
+      <p class="muted small">Provisions a producer on the shared cloud core. It generates its own
+      block-signing key; you then register that key with your wallet.</p>
+      <button id="startNode" class="green" disabled>Start my node</button>
+    </div>
+    <div id="nodeInfo" class="hide">
+      <div class="kv"><span class="k">Node</span><span class="v"><span id="nodeStatePill" class="pill wait">…</span></span></div>
+      <div class="kv"><span class="k">Core sync</span><span class="v" id="coreSync">—</span></div>
+      <div class="kv"><span class="k">Registered</span><span class="v"><span id="regPill" class="pill off">no</span></span></div>
+      <label>Block-signing public key</label>
+      <textarea id="pubkey" readonly rows="2" class="mono"></textarea>
+      <div class="row">
+        <button id="copyPub" class="secondary">Copy</button>
+        <button id="registerKey" class="green">Register key with wallet</button>
+      </div>
+
+      <label style="margin-top:16px">Burn KOIN → VHP (needed to actually produce)</label>
+      <div class="row">
+        <input id="burnAmt" type="number" min="0" step="0.00000001" placeholder="KOIN amount" />
+        <button id="burnBtn" class="secondary" style="flex:0 0 auto">Burn</button>
+      </div>
+
+      <div class="row" style="margin-top:16px">
+        <button id="stopNode" class="secondary">Pause</button>
+        <button id="startAgain" class="secondary hide">Resume</button>
+        <button id="deleteNode" class="danger">Delete</button>
+      </div>
+    </div>
+  </section>
+
+  <div class="warnbox small">Testing build. Not audited. Keys live in this browser's storage — use a
+  throwaway/test wallet. The eventual app will generate and hold keys more securely.</div>
+</main>
+
+<div id="toast"></div>
+
+<script src="vendor/koinos.min.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

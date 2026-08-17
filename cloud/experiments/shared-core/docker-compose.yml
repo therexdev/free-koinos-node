@@ -1,0 +1,77 @@
+# Shared-core spike — ONE chain/mempool/block_store core serving MANY independent
+# block producers. Each producer has its own basedir (its own private.key) and its
+# own --producer address; none of them collide on AMQP. This is the density design
+# behind the "<$1/user" cloud-node cost model (see FINDINGS.md).
+#
+# Run: ./setup.sh   (copies config assets from ../../../node-template), then
+#      docker compose up -d
+#
+# Producer addresses below are two well-known mainnet addresses used only so the
+# producers parse a valid --producer; they won't actually produce without VHP.
+services:
+  amqp:
+    image: rabbitmq:3-management
+    restart: always
+    volumes:
+      - "./config/rabbitmq.conf:/etc/rabbitmq/rabbitmq.conf:ro"
+    ports:
+      - "127.0.0.1:15672:15672"   # management API (host-only) — inspect queues/bindings
+      - "127.0.0.1:5672:5672"
+
+  # ---------- shared core (one set, regardless of how many producers) ----------
+  chain:
+    image: koinos/koinos-chain:v1.5.2
+    restart: always
+    depends_on: [amqp]
+    volumes:
+      - "./core:/koinos"
+      - "./config/config.yml:/koinos/config.yml:ro"
+      - "./config/genesis_data.json:/koinos/chain/genesis_data.json:ro"
+    command: --basedir=/koinos
+
+  mempool:
+    image: koinos/koinos-mempool:v1.5.0
+    restart: always
+    depends_on: [amqp, chain]
+    volumes:
+      - "./core:/koinos"
+      - "./config/config.yml:/koinos/config.yml:ro"
+    command: --basedir=/koinos
+
+  block_store:
+    image: koinos/koinos-block-store:v1.1.0
+    restart: always
+    depends_on: [amqp, chain]
+    volumes:
+      - "./core:/koinos"
+      - "./config/config.yml:/koinos/config.yml:ro"
+    command: --basedir=/koinos
+
+  # (a real deployment also runs p2p here to sync + gossip; omitted in the spike
+  #  because the AMQP-topology proof does not require external connectivity.)
+
+  # ---------- per-user producers (the cheap, replicable unit) ----------
+  # Each is ~3 MB RAM + a key file. Add one per user; they share the core above.
+  producer1:
+    image: koinos/koinos-block-producer:v1.3.1
+    restart: always
+    depends_on: [amqp, chain, mempool]
+    volumes:
+      - "./p1:/koinos"
+      - "./config/config.yml:/koinos/config.yml:ro"
+    command: >-
+      --basedir=/koinos --algorithm pob
+      --producer 19GYjDBVXU7keLbYvMLazsGQn3GTWHjHkK
+      --amqp amqp://guest:guest@amqp:5672/
+
+  producer2:
+    image: koinos/koinos-block-producer:v1.3.1
+    restart: always
+    depends_on: [amqp, chain, mempool]
+    volumes:
+      - "./p2:/koinos"
+      - "./config/config.yml:/koinos/config.yml:ro"
+    command: >-
+      --basedir=/koinos --algorithm pob
+      --producer 12Y5vW6gk8GceH53YfRkRre2Rrcsgw7Naq
+      --amqp amqp://guest:guest@amqp:5672/

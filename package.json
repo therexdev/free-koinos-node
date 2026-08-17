@@ -1,0 +1,85 @@
+{
+  "name": "free-koinos-node",
+  "productName": "Free Koinos Node",
+  "version": "0.1.0",
+  "description": "Desktop app that runs a block-producing Koinos node and, instead of keeping block rewards, redistributes the profit evenly to every producing node on the network with enough VHP \u2014 reburning the rest to keep its own VHP level",
+  "main": "electron/main.js",
+  "private": true,
+  "license": "MIT",
+  "author": "therexdev",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/therexdev/free-koinos-node.git"
+  },
+  "scripts": {
+    "start": "electron .",
+    "test": "node --test",
+    "dist": "electron-builder --publish never",
+    "dist:win": "electron-builder --win --publish never",
+    "release": "electron-builder --publish always"
+  },
+  "dependencies": {
+    "@koindx/v2-sdk": "^1.3.0",
+    "bignumber.js": "^11.1.5",
+    "electron-updater": "^6.8.9",
+    "ethers": "^6.17.0",
+    "koilib": "^9.2.0"
+  },
+  "devDependencies": {
+    "electron": "^43.3.0",
+    "electron-builder": "^26.15.3"
+  },
+  "build": {
+    "appId": "com.therexdev.free-koinos-node",
+    "productName": "Free Koinos Node",
+    "artifactName": "Free-Koinos-Node-${version}-${os}-${arch}.${ext}",
+    "directories": {
+      "buildResources": "build",
+      "output": "dist"
+    },
+    "files": [
+      "electron/**/*",
+      "ui/**/*",
+      "node-template/**/*",
+      "package.json"
+    ],
+    "asarUnpack": [
+      "node-template/**"
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ]
+    },
+    "nsis": {
+      "oneClick": true,
+      "perMachine": false,
+      "shortcutName": "Free Koinos Node",
+      "deleteAppDataOnUninstall": false
+    },
+    "mac": {
+      "target": [
+        "dmg",
+        "zip"
+      ],
+      "category": "public.app-category.finance"
+    },
+    "linux": {
+      "target": [
+        "AppImage"
+      ],
+      "category": "Finance"
+    },
+    "publish": {
+      "provider": "github",
+      "owner": "therexdev",
+      "repo": "free-koinos-node",
+      "releaseType": "draft"
+    }
+  }
+}

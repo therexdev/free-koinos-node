@@ -1,0 +1,14 @@
+{
+  "name": "Koinos Cloud Node",
+  "short_name": "Koinos Node",
+  "description": "Run your own Koinos block producer in the cloud — your key, your vote, 100% of rewards.",
+  "start_url": ".",
+  "scope": ".",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#0b0e14",
+  "theme_color": "#0b0e14",
+  "icons": [
+    { "src": "icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" }
+  ]
+}

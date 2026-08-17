@@ -1,0 +1,15 @@
+{
+  "name": "koinos-cloud-agent",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Status agent for a cloud-hosted Koinos node — exposes the block-signing public key and sync/production status over a token-protected HTTP API. No dependencies.",
+  "main": "agent.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node agent.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT"
+}

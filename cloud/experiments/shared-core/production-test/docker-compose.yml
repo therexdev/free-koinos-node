@@ -1,0 +1,50 @@
+# prod2: known-interoperable CURRENT stack (chain v1.5.2 + producer v1.3.1) fed
+# the local-koinos genesis + authorized key, federated production, gossip off
+# (no p2p). Two producers on one shared core producing concurrently.
+services:
+  amqp:
+    image: rabbitmq:3-management
+    restart: always
+
+  chain:
+    image: koinos/koinos-chain:v1.5.2
+    restart: always
+    depends_on: [amqp]
+    volumes:
+      - "./core:/koinos"
+      - "./config/config.yml:/koinos/config.yml:ro"
+    command: --basedir=/koinos -a amqp://guest:guest@amqp:5672/ --reset true
+
+  mempool:
+    image: koinos/koinos-mempool:v1.5.0
+    restart: always
+    depends_on: [amqp, chain]
+    volumes:
+      - "./config/config.yml:/koinos/config.yml:ro"
+    command: --basedir=/koinos -a amqp://guest:guest@amqp:5672/
+
+  block_store:
+    image: koinos/koinos-block-store:v1.1.0
+    restart: always
+    depends_on: [amqp, chain]
+    volumes:
+      - "./config/config.yml:/koinos/config.yml:ro"
+    command: --basedir=/koinos -a amqp://guest:guest@amqp:5672/
+
+  producer1:
+    image: koinos/koinos-block-producer:v1.3.1
+    restart: always
+    depends_on: [amqp, chain, mempool]
+    volumes:
+      - "./p1:/koinos"
+      - "./config/config.yml:/koinos/config.yml:ro"
+    command: --basedir=/koinos -a amqp://guest:guest@amqp:5672/ --algorithm federated --gossip-production false
+
+  producer2:
+    image: koinos/koinos-block-producer:v1.3.1
+    restart: always
+    depends_on: [amqp, chain, mempool]
+    volumes:
+      - "./p2:/koinos"
+      - "./config/config.yml:/koinos/config.yml:ro"
+    command: --basedir=/koinos -a amqp://guest:guest@amqp:5672/ --algorithm federated --gossip-production false

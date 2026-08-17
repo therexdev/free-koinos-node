@@ -1,0 +1,11 @@
+global:
+  amqp: amqp://guest:guest@amqp:5672/
+  log-level: info
+  log-color: false
+  log-datetime: true
+  log-dir: logs
+  instance-id: sharedcore
+  fork-algorithm: pob
+  blacklist:
+    - block_store.add_block
+    - chain.propose_block

@@ -1,0 +1,8 @@
+# runtime basedirs
+core/
+p1/
+p2/
+# assets copied from node-template by setup.sh (not duplicated in the repo)
+config/genesis_data.json
+config/koinos_descriptors.pb
+config/rabbitmq.conf

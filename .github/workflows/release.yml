@@ -1,0 +1,120 @@
+name: Release installers
+
+# Builds and publishes installers to a GitHub Release. Two ways to trigger:
+#   • push a version tag:      npm version <patch|minor|preminor --preid=beta> && git push --follow-tags
+#   • manually (Actions tab → Release installers → Run workflow), which builds
+#     the version currently in package.json.
+# Channel is chosen by the version shape: a prerelease version (vX.Y.Z-beta.N —
+# anything with a hyphen) publishes as a GitHub Pre-release and is never marked
+# "latest"; a plain version publishes as "latest".
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  # Resolve the release tag + channel once, so every job agrees. On a tag push
+  # the tag is the pushed ref; on a manual run it's derived from package.json.
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+      prerelease: ${{ steps.resolve.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: resolve
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="v$(node -p "require('./package.json').version")"
+          else
+            TAG="${GITHUB_REF_NAME}"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          if [[ "$TAG" == *-* ]]; then
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "Resolved TAG=$TAG (prerelease=$([[ "$TAG" == *-* ]] && echo true || echo false))"
+
+  # Create the release once, up front, as a draft. This avoids the race where
+  # three parallel build jobs each try to CREATE the release and all but one
+  # get "422 already_exists".
+  create-release:
+    needs: setup
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Ensure a draft release exists for this tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.setup.outputs.tag }}
+        run: |
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $TAG already exists — reusing it."
+          else
+            # On a manual run the git tag doesn't exist yet; point the (pending)
+            # tag at the dispatched commit. On a tag push the tag already exists
+            # and --target is ignored.
+            EXTRA=""
+            if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+              EXTRA="--target $GITHUB_SHA"
+            fi
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --draft $EXTRA \
+              --title "$TAG" \
+              --notes "Automated build of $TAG. Windows, macOS and Linux installers are attached below."
+          fi
+
+  # Each OS builds and uploads its installer to the existing draft release.
+  build:
+    needs: create-release
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      - run: npm test
+
+      # publish.releaseType is "draft", so electron-builder finds the draft
+      # created above (matched by the package.json version's tag) and just
+      # uploads to it — no create race.
+      - run: npx electron-builder --publish always
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # Once every OS has uploaded, flip the draft to a published release. The tag
+  # shape picks the channel: a prerelease tag (vX.Y.Z-beta.N) is published as a
+  # GitHub Pre-release and is NEVER marked "latest", so stable/live installs
+  # don't pick it up; a plain tag is published as "latest" for everyone. The
+  # auto-updater side lives in setupAutoUpdates() (allowPrerelease keys off the
+  # build's own version).
+  publish-release:
+    needs: [setup, build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Publish the release (stable = latest, prerelease = beta channel)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.setup.outputs.tag }}
+          PRERELEASE: ${{ needs.setup.outputs.prerelease }}
+        run: |
+          if [ "$PRERELEASE" = "true" ]; then
+            echo "Prerelease $TAG → beta channel (not marked latest)."
+            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false --prerelease --latest=false
+          else
+            echo "Stable $TAG → latest."
+            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false --prerelease=false --latest
+          fi

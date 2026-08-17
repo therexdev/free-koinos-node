@@ -1,0 +1,11 @@
+{
+  "name": "koinoskit-onramp-endpoint",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Serverless endpoint that mints Coinbase Onramp session tokens for KoinosKit's Fund node button",
+  "dependencies": {
+    "@coinbase/cdp-sdk": "^1",
+    "koilib": "^9.2.0"
+  }
+}
