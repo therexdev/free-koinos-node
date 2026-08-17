@@ -153,6 +153,11 @@ const DEFAULT_SETTINGS = {
     minPayoutKoin: "0.5",     // skip a cycle when the even share would be below this
     pollMinutes: 10,          // engine check interval (snapshots + queue draining)
   },
+  // Prefer the node this app runs for chain reads when it is up and caught up,
+  // falling back to the public endpoint. Your own node is the same chain data,
+  // it keeps working when a public endpoint is down or rate-limited, and the
+  // queries never leave the machine.
+  useLocalNodeRpc: true,
   keepLiquidKoin: "10",   // liquid KOIN kept as a balance buffer for mana
 };
 

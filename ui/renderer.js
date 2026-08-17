@@ -172,6 +172,7 @@ async function refreshNode() {
   // an unlock — the node produces blocks whether or not the app is unlocked.
   await refreshBalances().catch(() => {});
   patchNodeView();
+  patchRpcSource();
 }
 
 async function refreshRewards() {
@@ -2553,6 +2554,7 @@ const DISTRIBUTION_OUTCOME_LABELS = {
   "history-unavailable": ["pill bad", "no history RPC"],
   syncing: ["pill accent", "reading history…"],
   anchored: ["pill accent", "tracking started"],
+  "re-anchored": ["pill warn", "re-anchored"],
   watching: ["pill accent", "watching network"],
   "cycle-closed": ["pill good", "cycle closed"],
   "cycle-held": ["pill warn", "held — roster unavailable"],
@@ -2844,6 +2846,15 @@ function renderSettingsView() {
       <button id="set-save" class="btn primary">Save settings</button>
     </div>
     <div class="card">
+      <h2>\u26d3\ufe0f Chain data source</h2>
+      <label class="field"><span class="row" style="gap:8px">
+        <input type="checkbox" id="set-localrpc" ${s.useLocalNodeRpc !== false ? "checked" : ""} style="width:auto">
+        <b>Use my own node for chain data when it's running</b></span></label>
+      <div id="set-rpc-now" class="stack"></div>
+      <p class="hint">Your node holds the same chain — reading from it keeps the app working when a public endpoint is down or rate-limited, and no query leaves this machine. The public endpoint stays as an automatic fallback. A node that is still syncing is skipped, since it would report stale balances.</p>
+      <p class="hint">Block-reward history comes from the node's <span class="mono">account_history</span> service, which this app now runs for you. It indexes from when it was first enabled, so its lifetime totals can start lower than a public endpoint's — the distribution engine re-anchors itself when that happens rather than stalling.</p>
+    </div>
+    <div class="card">
       <h2>🔐 Wallet security</h2>
       <div class="row">
         <button id="set-reveal" class="btn">Reveal private key</button>
@@ -2852,6 +2863,7 @@ function renderSettingsView() {
       <p class="hint">Files live in <span class="mono">${esc(S.appInfo.userData)}</span> <button class="link" id="set-open">open ↗</button></p>
     </div>`;
 
+  patchRpcSource();
   $("#set-save").addEventListener("click", onSaveSettings);
   $("#set-open").addEventListener("click", () => call("util:openPath", { which: "userData" }).catch(() => {}));
   $("#set-reveal").addEventListener("click", onRevealWif);
@@ -2868,6 +2880,7 @@ async function onSaveSettings() {
     const settings = await call("settings:update", {
       network,
       customRpc,
+      useLocalNodeRpc: $("#set-localrpc").checked,
       keepLiquidKoin: $("#set-keep").value.trim(),
     });
     S.appInfo.settings = settings;
@@ -2936,6 +2949,31 @@ function onRemoveWallet() {
       },
     ],
   });
+}
+
+// Which endpoint chain reads are actually going to right now. Sourced from
+// node:status (refreshed on the Node tab) or app:info at startup.
+function patchRpcSource() {
+  const el = $("#set-rpc-now");
+  if (!el) return;
+  const r = S.node?.rpc ?? S.appInfo?.rpc ?? null;
+  if (!r) { el.innerHTML = `<span class="muted small">Checking…</span>`; return; }
+  const label = r.custom
+    ? `<span class="pill">custom RPC</span> <span class="mono small">${esc(r.custom)}</span>`
+    : r.usingLocal
+      ? `<span class="pill good">your node</span> <span class="mono small">${esc(r.active ?? "")}</span>`
+      : `<span class="pill warn">public endpoint</span> <span class="mono small">${esc(r.active ?? "")}</span>`;
+  const why = r.custom
+    ? "A custom RPC overrides everything else."
+    : r.usingLocal
+      ? "Reading from the node on this machine."
+      : r.preferLocal
+        ? "Your node isn't answering yet (or is still syncing) — using the public endpoint until it catches up."
+        : "Preferring your own node is switched off.";
+  el.innerHTML = `
+    <div class="row spread"><span class="muted">Serving chain reads</span><span>${label}</span></div>
+    <div class="muted small">${esc(why)}</div>
+    ${r.fallbacks?.length ? `<div class="row spread"><span class="muted">Fallback</span><span class="mono small">${esc(r.fallbacks.join(", "))}</span></div>` : ""}`;
 }
 
 // ---------- navigation + heartbeat ----------

@@ -29,6 +29,9 @@ function rpcError(e) {
 
 const CONTRACT_NAMES = ["koin", "vhp", "pob"];
 const RESOLVE_TTL_MS = 60 * 60 * 1000;
+const LOCAL_PROBE_TTL_MS = 30 * 1000;      // how often to re-check our own node
+const LOCAL_SYNC_TOLERANCE_MS = 2 * 60 * 1000; // head this fresh counts as caught up
+const FAILOVER_WINDOW_MS = 15 * 1000;      // window for one rotation through the endpoints
 
 class ChainService {
   constructor(settings) {
@@ -38,6 +41,7 @@ class ChainService {
 
   clearCache() {
     this._resolved = {};
+    this._localHealth = {}; // re-probe our node on the next call
   }
 
   // The canonical KOIN/VHP/PoB addresses can change (the token contracts have
@@ -89,15 +93,84 @@ class ChainService {
     return NETWORKS[this.settings.get("network", "mainnet")] ?? NETWORKS.mainnet;
   }
 
+  // Is the node we manage answering AND caught up? Probed in the background and
+  // cached, because rpcUrls() is synchronous and sits on every call path. A
+  // node that is still syncing is deliberately NOT used: it would answer with
+  // stale balances and a short block history, which is worse than a public
+  // endpoint. Unknown counts as down, so the first call after launch uses the
+  // public endpoint and later ones switch over once the probe lands.
+  _localNodeUsable() {
+    const net = this.network();
+    const st = ((this._localHealth ??= {})[net.id] ??= { up: false, at: 0, checking: false });
+    if (!st.checking && Date.now() - st.at > LOCAL_PROBE_TTL_MS) {
+      st.checking = true;
+      (async () => {
+        let up = false;
+        try {
+          const head = await new Provider([net.localRpcUrl]).getHeadInfo();
+          const headMs = Number(head?.head_block_time ?? 0);
+          up = Date.now() - headMs < LOCAL_SYNC_TOLERANCE_MS;
+        } catch {
+          up = false;
+        }
+        st.up = up;
+        st.at = Date.now();
+        st.checking = false;
+      })();
+    }
+    return st.up;
+  }
+
+  // Which endpoints to use, best first. An explicit custom RPC always wins;
+  // otherwise our own synced node leads and the public endpoint backs it up.
   rpcUrls() {
     const net = this.network();
     const custom = this.settings.get(`customRpc.${net.id}`, "");
     if (custom && /^https?:\/\//.test(custom)) return [custom];
-    return net.rpcUrls.length > 0 ? net.rpcUrls : [net.localRpcUrl];
+    const pub = net.rpcUrls;
+    if (this.settings.get("useLocalNodeRpc", true) && this._localNodeUsable()) {
+      return [net.localRpcUrl, ...pub];
+    }
+    return pub.length > 0 ? pub : [net.localRpcUrl];
+  }
+
+  // What the UI reports about where chain data is coming from.
+  rpcStatus() {
+    const net = this.network();
+    const custom = this.settings.get(`customRpc.${net.id}`, "");
+    const urls = this.rpcUrls();
+    return {
+      urls,
+      active: urls[0] ?? null,
+      usingLocal: urls[0] === net.localRpcUrl,
+      localUrl: net.localRpcUrl,
+      localUsable: this._localNodeUsable(),
+      preferLocal: !!this.settings.get("useLocalNodeRpc", true),
+      custom: custom || null,
+      fallbacks: urls.slice(1),
+    };
   }
 
   provider(urls) {
-    return new Provider(urls ?? this.rpcUrls());
+    const list = urls ?? this.rpcUrls();
+    const p = new Provider(list);
+    // koilib's default onError returns true, which ABORTS on the first failure
+    // — so a list of endpoints is not a fallback chain unless we make it one.
+    // Allow one full rotation within a short window (so a request survives our
+    // node going down mid-flight), then give up rather than spin forever.
+    if (list.length > 1) {
+      let fails = 0;
+      let windowAt = 0;
+      p.onError = () => {
+        const now = Date.now();
+        if (now - windowAt > FAILOVER_WINDOW_MS) {
+          fails = 0;
+          windowAt = now;
+        }
+        return ++fails >= list.length;
+      };
+    }
+    return p;
   }
 
   isValidAddress(address) {

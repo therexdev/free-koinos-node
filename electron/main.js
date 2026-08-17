@@ -263,9 +263,10 @@ function registerIpc({ settings, state, wallet, chain, nodeMgr, setup, rewards, 
     networks: publicNetworks,
     settings: settings.all(),
     minPasswordLength: MIN_PASSWORD_LENGTH,
+    rpc: chain.rpcStatus(),
   }));
 
-  handle("settings:update", ({ network, customRpc, keepLiquidKoin, onrampEndpoint }) => {
+  handle("settings:update", ({ network, customRpc, keepLiquidKoin, onrampEndpoint, useLocalNodeRpc }) => {
     if (network !== undefined) {
       if (!NETWORKS[network]) throw new Error(`Unknown network: ${network}`);
       settings.set("network", network);
@@ -279,6 +280,10 @@ function registerIpc({ settings, state, wallet, chain, nodeMgr, setup, rewards, 
         settings.set(`customRpc.${netId}`, url || "");
       }
       chain.clearCache();
+    }
+    if (useLocalNodeRpc !== undefined) {
+      settings.set("useLocalNodeRpc", !!useLocalNodeRpc);
+      chain.clearCache(); // re-probe our node and re-pick the endpoint order
     }
     if (keepLiquidKoin !== undefined) {
       parseAmount(keepLiquidKoin);
@@ -406,7 +411,7 @@ function registerIpc({ settings, state, wallet, chain, nodeMgr, setup, rewards, 
     if (!status.docker?.ok) {
       setupStatus = await setup.status().catch(() => null);
     }
-    return { network: networkId, ...status, sync, setup: setupStatus };
+    return { network: networkId, ...status, sync, setup: setupStatus, rpc: chain.rpcStatus() };
   });
 
   // ----- guided setup (WSL + Docker) -----

@@ -382,6 +382,28 @@ class DistributionEngine {
       });
     }
 
+    // Lifetime totals can legitimately go BACKWARDS when the history source
+    // changes: our own node's account_history indexes forward from the moment
+    // it is first enabled, so it knows less than a public endpoint that has the
+    // whole chain. Measuring this cycle against a higher anchor would read as
+    // "no rewards yet" for as long as it took to catch up — distribution would
+    // quietly stall. Re-anchor to the new baseline instead and keep going; the
+    // cost is one cycle's accounting, never a wrong payout.
+    if (
+      cmpSats(statsRes.totals.rewards, st.anchor.rewards) < 0 ||
+      cmpSats(statsRes.totals.vhpConsumed, st.anchor.vhpConsumed) < 0
+    ) {
+      st.anchor = { rewards: statsRes.totals.rewards, vhpConsumed: statsRes.totals.vhpConsumed };
+      st.cycleStartedAt = now;
+      this.state.set(key, st);
+      return done("re-anchored", {
+        message:
+          "Reward history now reports lower lifetime totals than when this cycle started — " +
+          "usually the chain data source changing (your own node indexes history from when it " +
+          "was enabled). Re-anchored to the new baseline; distribution continues from here.",
+      });
+    }
+
     // Snapshot who is producing on the network right now (best-effort — an RPC
     // hiccup here must not stall accounting or the payout queue).
     let snapshotError = null;
