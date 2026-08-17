@@ -100,7 +100,21 @@ async function fetchAiRoster(url, { isValidAddress, timeoutMs = DEFAULT_TIMEOUT_
   let rejected = 0;
   for (const a of extractAddresses(payload)) {
     if (seen.has(a)) continue;
-    if (isValidAddress && !isValidAddress(a)) {
+    // A validator may THROW on malformed input rather than return false —
+    // koilib's isChecksumAddress does exactly that on a truncated address
+    // like "1HU2QZ…zY2x". Treat that as "not an address" instead of letting
+    // it abort the whole read: one junk entry must not cost us the roster,
+    // and an all-truncated roster has to surface as unusable addresses (which
+    // the engine explains) rather than as an unreachable endpoint.
+    let valid = true;
+    if (isValidAddress) {
+      try {
+        valid = !!isValidAddress(a);
+      } catch {
+        valid = false;
+      }
+    }
+    if (!valid) {
       rejected += 1;
       continue;
     }

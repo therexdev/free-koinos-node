@@ -84,6 +84,32 @@ test("HTTP and JSON failures raise, so the cycle can fail closed", async () => {
   );
 });
 
+test("a validator that throws is treated as a rejection, not a dead roster", async () => {
+  // koilib's isChecksumAddress THROWS on a truncated address rather than
+  // returning false. If that escaped, an all-truncated roster would look like
+  // an unreachable endpoint instead of one returning unusable addresses — and
+  // one junk entry would cost us the whole roster.
+  const throwing = (a) => {
+    if (a.includes("\u2026")) throw new Error("invalid character '\u2026'");
+    return /^1[A-Za-z0-9]{3,}$/.test(a);
+  };
+  const res = await fetchAiRoster("https://kai.example/roster", {
+    isValidAddress: throwing,
+    fetchImpl: ok(["1good", "1HU2QZ\u2026zY2x", "1alsogood"]),
+  });
+  assert.deepEqual(res.addresses, ["1good", "1alsogood"]);
+  assert.equal(res.rejected, 1);
+
+  // The all-truncated case reports zero accepted with a rejection count, which
+  // is exactly what the engine keys its "unusable addresses" hold on.
+  const allBad = await fetchAiRoster("https://kai.example/roster", {
+    isValidAddress: throwing,
+    fetchImpl: ok(["1aaaaa\u2026wxyz", "1bbbbb\u2026wxyz"]),
+  });
+  assert.deepEqual(allBad.addresses, []);
+  assert.equal(allBad.rejected, 2);
+});
+
 test("an oversized roster body is refused", async () => {
   const huge = JSON.stringify(Array.from({ length: 200000 }, (_, i) => `1addr${i}`));
   await assert.rejects(
