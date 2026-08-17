@@ -4,6 +4,12 @@ name: Release installers
 #   • push a version tag:      npm version <patch|minor|preminor --preid=beta> && git push --follow-tags
 #   • manually (Actions tab → Release installers → Run workflow), which builds
 #     the version currently in package.json.
+#
+# On a freshly created repository this workflow only appears in the Actions tab
+# once GitHub has indexed it, and GitHub indexes workflow files when it receives
+# a push *while Actions is enabled*. If Actions was still switched off when the
+# code first landed, enabling it afterwards does not backfill — push any commit
+# touching this file and the workflow registers itself.
 # Channel is chosen by the version shape: a prerelease version (vX.Y.Z-beta.N —
 # anything with a hyphen) publishes as a GitHub Pre-release and is never marked
 # "latest"; a plain version publishes as "latest".
