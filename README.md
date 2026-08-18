@@ -28,8 +28,8 @@ With **Community distribution** enabled (Distribution tab):
      **re-burned** (KOIN → VHP), so your node's VHP ends the day level and it
      keeps producing at the same rate.
    - The **profit** is split between every node that met the eligibility
-     requirements (below), in proportion to **how much of the window each was
-     present for** — never in proportion to stake. A node with 1,000,000 VHP
+     requirements (below), in proportion to **the rewards each was qualifying
+     for as they were earned** — never in proportion to stake. A node with 1,000,000 VHP
      earns exactly what a node with 10,000 earns for the same uptime. With
      everyone present the whole window, 100 KOIN across 10 nodes is 10 KOIN
      each. Your own node counts as one of them and simply keeps its share.
@@ -43,29 +43,33 @@ If the even share would be smaller than the minimum payout (a setting), nothing
 is sent that day and the whole pool carries into the next day's pot. Integer
 division remainders carry over too — satoshis are never dropped.
 
-### How shares are sized — participation, not stake or timing
+### How shares are sized — by the rewards you were there for
 
-Every check interval takes a **presence sample**. At settlement, a node's share
-is proportional to the samples it was present for, so somebody who joins in the
-last ten minutes of the day collects a last-ten-minutes share — not a full one,
-and not a slice of a large pool that rolled over from previous days.
+Every time your node collects a block reward, **each address qualifying at that
+moment is credited with it**. At settlement the pool is divided in proportion to
+those credits.
 
-Presence is measured differently per signal, deliberately:
+Worked through: your node mines a block while only A qualifies, then another
+while A and B both qualify. Credits are A=2, B=1, so A takes 66% and B takes
+33%. A third reward with A gone and C arrived makes it A=2, B=2, C=1 — 40/40/20.
+Somebody who appears ten minutes before payout is credited for ten minutes of
+rewards, not for the day.
 
-- **Block producers** are credited for the **span between their first and last
-  block** in the window, *not* the number of blocks they signed. Block count is
-  proportional to stake, so paying by it would quietly reintroduce "more VHP,
-  more reward". A span of "tick 4 through tick 141" reads identically for a
-  10,000 VHP node and a 1,000,000 VHP node, and a node at the minimum that goes
-  hours between blocks is not punished for it (a block keeps a producer counted
-  as present for 3 hours).
-- **Koinos AI Nodes** are credited for actual roster appearances, since the
-  roster is a true liveness list.
-- **With both gates on**, a node earns the *lesser* of the two — it is credited
-  only for time it genuinely satisfied both requirements.
+Three properties fall out of this, all deliberate:
 
-Switch **How the pool is split** to *Evenly* for a flat split among everyone who
-qualified, which ignores presence entirely.
+- **Stake never buys a bigger share.** Credits are per reward *event*, not per
+  block signed, so a 1,000,000 VHP node and a 10,000 VHP node qualifying for the
+  same rewards earn the same.
+- **Rolled-over pools stay with who earned them.** Credits are cleared only when
+  a pool is actually paid out — never when a cycle carries — so a node arriving
+  after a quiet week cannot collect a share of that week.
+- **Eligibility is judged as the credit accrues**, not once at the end. Buying
+  VHP or joining the roster just before settlement earns nothing retroactively.
+  (VHP balances are re-read hourly rather than every check, which bounds the RPC
+  cost; that hour is the width of the window.)
+
+Switch **How the pool is split** to *Evenly* for a flat split among everyone
+holding credit, which ignores how much they earned.
 
 A share that lands below the minimum payout is skipped and carried rather than
 sent, because every payout spends mana 1:1 — dust transfers cost real resource
@@ -119,7 +123,7 @@ never distributed.
 | Setting | Default | Meaning |
 | --- | --- | --- |
 | Enable community distribution | off | Off = behave like a normal node |
-| How the pool is split | By participation | Share ∝ time present in the window; or a flat even split |
+| How the pool is split | By rewards earned | Share ∝ the rewards each node was qualifying for; or a flat even split |
 | Require VHP minimum | on | Gate 1: must be producing blocks with enough VHP |
 | Running Koinos AI Node | off | Gate 2: must be seen on the Koinos AI network |
 | Minimum VHP to qualify | 10,000 | A producer must hold at least this much VHP to receive a share |
