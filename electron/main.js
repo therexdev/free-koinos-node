@@ -113,6 +113,7 @@ if (!gotLock) {
       dataRoot: path.join(userData, "node"),
       onEvent: sendEvent,
       autoRecover: settings.get("node.autoRecover", true),
+      accountHistory: settings.get("node.accountHistory", false),
       // Lets the watchdog notice a wedged chain: report the local head height.
       probeHead: async () => {
         const s = await chain.syncStatus().catch(() => null);

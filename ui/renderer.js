@@ -2865,7 +2865,7 @@ function renderSettingsView() {
         <b>Use my own node for chain data when it's running</b></span></label>
       <div id="set-rpc-now" class="stack"></div>
       <p class="hint">Your node holds the same chain — reading from it keeps the app working when a public endpoint is down or rate-limited, and no query leaves this machine. The public endpoint stays as an automatic fallback. A node that is still syncing is skipped, since it would report stale balances.</p>
-      <p class="hint">Block-reward history comes from the node's <span class="mono">account_history</span> service, which this app now runs for you. It indexes from when it was first enabled, so its lifetime totals can start lower than a public endpoint's — the distribution engine re-anchors itself when that happens rather than stalling.</p>
+      <p class="hint">Balances, block headers and sync status come from your node. <b>Block-reward history does not</b> — that needs the node's <span class="mono">account_history</span> service, which is deliberately <b>not</b> run: enabling it rebuilds the index from genesis by replaying every block through the message bus, which starves block production for days. History is read from the public endpoint instead.</p>
     </div>
     <div class="card">
       <h2>🔐 Wallet security</h2>

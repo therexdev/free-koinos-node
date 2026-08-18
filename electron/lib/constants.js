@@ -125,6 +125,11 @@ const DEFAULT_SETTINGS = {
   customRpc: {},          // { [networkId]: "https://..." }
   node: {
     autoRecover: true,    // self-heal: auto-restart the node if it stalls/crashes
+    // Run account_history on our own node. OFF by default: it rebuilds the
+    // index from GENESIS, replaying ~38M blocks through the message bus, which
+    // degrades block production for days while it runs. Reward history comes
+    // from the public endpoint instead unless this is deliberately enabled.
+    accountHistory: false,
   },
   rewards: {
     enabled: false,
