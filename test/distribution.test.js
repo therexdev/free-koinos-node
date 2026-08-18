@@ -4,6 +4,7 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const {
   DistributionEngine,
+  participationWeight,
   validateDistributionConfig,
   nextCycleClose,
   mergeSeen,
@@ -23,9 +24,11 @@ test("validateDistributionConfig normalizes and rejects bad values", () => {
     minVhpKoin: "10000", payoutHourUtc: "3", minPayoutKoin: "0.5", pollMinutes: "15",
   });
   assert.deepEqual(cfg, {
-    enabled: true, requireVhpMinimum: true, requireAiNode: false, aiRosterUrl: "",
+    enabled: true, weighting: "participation",
+    requireVhpMinimum: true, requireAiNode: false, aiRosterUrl: "",
     minVhpKoin: "10000", payoutHourUtc: 3, minPayoutKoin: "0.5", pollMinutes: 15,
   });
+  assert.throws(() => validateDistributionConfig({ weighting: "sideways", minVhpKoin: "1", payoutHourUtc: 0, minPayoutKoin: "1", pollMinutes: 10 }), /weighting/);
   // A blank roster URL stays allowed with the AI gate on (the engine fails
   // closed at settlement instead), but a malformed one is rejected on save.
   assert.equal(
@@ -213,6 +216,88 @@ test("negative period figures clamp to zero (fresh anchor edge cases)", () => {
   assert.equal(s.reburnSat, "0");
   assert.equal(s.profitSat, "0");
   assert.equal(s.recipients.length, 0);
+});
+
+// ---------- participation weighting (the anti-last-minute rule) ----------
+
+test("a node present all window outweighs one that showed up at the end", () => {
+  // 144 ticks = a day at 10-minute checks. One node was there the whole time,
+  // the other appeared for the last two ticks.
+  const s = settleCycle({
+    periodRewardsSat: KOIN(1100), periodVhpConsumedSat: KOIN(1000),
+    eligible: [{ address: "allday", weight: 144 }, { address: "latecomer", weight: 2 }],
+    ...settleBase,
+  });
+  const paid = Object.fromEntries(s.recipients.map((r) => [r.address, r.amountSat]));
+  assert.equal(paid.allday, "9863013698");   // 100 KOIN * 144/146
+  assert.equal(paid.latecomer, "136986301"); // 100 KOIN * 2/146 — ~1.4 KOIN, not 50
+  // Everything is accounted for: paid + carried == the pool.
+  assert.equal(
+    (BigInt(paid.allday) + BigInt(paid.latecomer) + BigInt(s.carryOutSat)).toString(),
+    s.poolSat
+  );
+});
+
+test("a big rolled-over pool does not reward a last-minute arrival", () => {
+  // The scenario that motivates this: a week of carry lands in one cycle.
+  const s = settleCycle({
+    periodRewardsSat: KOIN(100), periodVhpConsumedSat: KOIN(100), // no new profit
+    carrySat: KOIN(700), // a week of rolled-over rewards
+    eligible: [{ address: "steady", weight: 144 }, { address: "sniper", weight: 1 }],
+    selfAddress: "SELF", minPayoutSat: KOIN(1),
+  });
+  const paid = Object.fromEntries(s.recipients.map((r) => [r.address, r.amountSat]));
+  // The sniper gets 1/145 of the week, not half of it.
+  assert.equal(paid.sniper, "482758620");
+  assert.ok(BigInt(paid.steady) > BigInt(paid.sniper) * 140n);
+});
+
+test("even weighting is still available and splits flat", () => {
+  const s = settleCycle({
+    periodRewardsSat: KOIN(1100), periodVhpConsumedSat: KOIN(1000),
+    eligible: [{ address: "allday", weight: 144 }, { address: "latecomer", weight: 2 }],
+    ...settleBase, weighting: "even",
+  });
+  const paid = Object.fromEntries(s.recipients.map((r) => [r.address, r.amountSat]));
+  assert.equal(paid.allday, KOIN(50));
+  assert.equal(paid.latecomer, KOIN(50));
+});
+
+test("a share below the minimum is skipped and carried, not dusted out", () => {
+  // Paying dust is actively harmful: every payout spends mana 1:1.
+  const s = settleCycle({
+    periodRewardsSat: KOIN(110), periodVhpConsumedSat: KOIN(100),
+    eligible: [{ address: "steady", weight: 144 }, { address: "blip", weight: 1 }],
+    ...settleBase, // minimum 1 KOIN; blip's share is ~0.07
+  });
+  assert.equal(s.recipients.length, 1);
+  assert.equal(s.recipients[0].address, "steady");
+  assert.equal(s.skippedBelowMin, 1);
+  assert.ok(BigInt(s.carryOutSat) > 0n); // blip's slice rolls forward
+});
+
+test("nobody present for any measurable time -> whole pool carries", () => {
+  const s = settleCycle({
+    periodRewardsSat: KOIN(110), periodVhpConsumedSat: KOIN(100),
+    eligible: [{ address: "ghost", weight: 0 }], ...settleBase,
+  });
+  assert.equal(s.recipients.length, 0);
+  assert.equal(s.carryOutSat, KOIN(10));
+});
+
+test("participationWeight measures uptime, not stake or luck", () => {
+  const w = (o) => participationWeight({ totalTicks: 144, ...o });
+  // Producer span: first block tick 1, last block tick 144 -> full window,
+  // regardless of whether that was 5000 blocks or 5.
+  assert.equal(w({ producerSpanTicks: 144, requireVhpMinimum: true }), 144);
+  assert.equal(w({ producerSpanTicks: 3, requireVhpMinimum: true }), 3);
+  // AI gate alone counts actual roster appearances.
+  assert.equal(w({ aiTicks: 100, requireAiNode: true }), 100);
+  // Both gates: credited only for the lesser — a node that mined all day but
+  // served AI for an hour earns the hour.
+  assert.equal(w({ producerSpanTicks: 144, aiTicks: 6, requireVhpMinimum: true, requireAiNode: true }), 6);
+  // Never more than the window itself, whatever the inputs claim.
+  assert.equal(w({ producerSpanTicks: 999, requireVhpMinimum: true }), 144);
 });
 
 // ---------- per-tick planning (mana/liquid chunking) ----------

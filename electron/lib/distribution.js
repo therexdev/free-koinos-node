@@ -38,6 +38,12 @@ const MAX_TX_PER_TICK = 8;        // bound each tick's signing work
 const HISTORY_KEEP = 30;          // distribution cycles kept for the UI
 const ACTIONS_KEEP = 80;          // recent reburn/payout txs kept for the UI
 const REBURN_MIN_CHUNK = "100000000"; // don't reburn dust chunks (< 1 KOIN)…
+// How long after its last block a producer still counts as present. Block
+// production is a lottery weighted by stake, so a node at the VHP minimum can
+// go hours between blocks while being online the whole time. A generous window
+// keeps presence measuring UPTIME rather than stake — the opposite of what a
+// short window would do.
+const PRESENCE_WINDOW_MS = 3 * 60 * 60 * 1000;
 
 function validateDistributionConfig(cfg) {
   const minVhpKoin = String(cfg.minVhpKoin ?? "").trim();
@@ -60,8 +66,13 @@ function validateDistributionConfig(cfg) {
   if (!Number.isFinite(poll) || poll < 1 || poll > 24 * 60) {
     throw new Error("Check interval must be between 1 minute and 24 hours");
   }
+  const weighting = cfg.weighting === undefined ? "participation" : String(cfg.weighting);
+  if (!["participation", "even"].includes(weighting)) {
+    throw new Error("Share weighting must be participation or even");
+  }
   return {
     enabled: !!cfg.enabled,
+    weighting,
     requireVhpMinimum: !!cfg.requireVhpMinimum,
     requireAiNode: !!cfg.requireAiNode,
     minVhpKoin,
@@ -81,13 +92,18 @@ function nextCycleClose(afterMs, hourUtc) {
 }
 
 // Fold block headers into the cycle's seen-producers map. Mutates + returns.
-function mergeSeen(seen, headers) {
+function mergeSeen(seen, headers, nowMs = Date.now()) {
   for (const h of headers || []) {
     if (!h?.signer) continue;
-    const cur = seen[h.signer] ?? { blocks: 0, lastSeenHeight: 0, lastSeenMs: 0 };
+    const cur = seen[h.signer] ?? { blocks: 0, lastSeenHeight: 0, lastSeenMs: 0, lastObservedMs: 0 };
     cur.blocks += 1;
     if (h.height > cur.lastSeenHeight) cur.lastSeenHeight = h.height;
     if (h.timestamp > cur.lastSeenMs) cur.lastSeenMs = h.timestamp;
+    // When OUR scan saw them, as distinct from the block's own timestamp.
+    // Presence is judged on this: a header carrying a skewed or bogus
+    // timestamp must not cost a node the credit for a block we just watched
+    // it produce.
+    cur.lastObservedMs = nowMs;
     seen[h.signer] = cur;
   }
   return seen;
@@ -152,6 +168,34 @@ function selectEligible({ candidates, requireVhpMinimum, requireAiNode, minVhpSa
   return { eligible, rejected };
 }
 
+// How much of the cycle a node was actually around for, in ticks (one tick per
+// check interval). This is what stops a node that appears in the last ten
+// minutes from collecting a full share of a day's — or a rolled-over week's —
+// rewards.
+//
+// Producers are measured by the SPAN between their first and last block in the
+// window, not by how many blocks they signed. Block count is proportional to
+// stake, so paying by it would quietly undo "everyone gets an equal share
+// regardless of VHP". A span says "they were here from tick 4 to tick 141",
+// which a 10k-VHP node and a 1M-VHP node can report identically.
+//
+// AI nodes are measured by actual roster appearances, because the roster is a
+// true liveness list — no inference needed.
+//
+// With both gates on, a node is credited for the smaller of the two: it only
+// earns while it genuinely satisfied both requirements.
+function participationWeight({ producerSpanTicks = 0, aiTicks = 0, totalTicks = 0, requireVhpMinimum, requireAiNode }) {
+  const span = Math.max(0, Number(producerSpanTicks) || 0);
+  const ai = Math.max(0, Number(aiTicks) || 0);
+  let w;
+  if (requireAiNode && requireVhpMinimum) w = Math.min(span, ai);
+  else if (requireAiNode) w = ai;
+  else w = span;
+  const cap = Math.max(0, Number(totalTicks) || 0);
+  if (cap > 0) w = Math.min(w, cap);
+  return w;
+}
+
 // Close one cycle: how much to reburn, and how the profit pool splits.
 // Pure — everything in satoshi strings.
 //
@@ -161,7 +205,15 @@ function selectEligible({ candidates, requireVhpMinimum, requireAiNode, minVhpSa
 //                   (may include selfAddress; self keeps its share, no transfer)
 //   minPayoutSat  — when the even share is below this, nothing is paid and the
 //                   whole pool carries into the next cycle
-function settleCycle({ periodRewardsSat, periodVhpConsumedSat, carrySat, eligible, selfAddress, minPayoutSat }) {
+function settleCycle({
+  periodRewardsSat,
+  periodVhpConsumedSat,
+  carrySat,
+  eligible,
+  selfAddress,
+  minPayoutSat,
+  weighting = "participation",
+}) {
   const rewards = cmpSats(periodRewardsSat, "0") > 0 ? periodRewardsSat : "0";
   const vhpConsumed = cmpSats(periodVhpConsumedSat, "0") > 0 ? periodVhpConsumedSat : "0";
   // Reburn exactly what production consumed, so VHP ends the cycle level.
@@ -169,27 +221,68 @@ function settleCycle({ periodRewardsSat, periodVhpConsumedSat, carrySat, eligibl
   const profitSat = cmpSats(rewards, vhpConsumed) > 0 ? subSats(rewards, vhpConsumed) : "0";
   const poolSat = addSats(profitSat, carrySat ?? "0");
 
-  const n = eligible.length;
+  // Accept plain addresses (every share equal) or {address, weight} entries.
+  // "even" collapses the weights, which is the old flat split.
+  const entries = (eligible ?? []).map((e) => {
+    const address = typeof e === "string" ? e : e.address;
+    const raw = typeof e === "string" ? 1 : Math.max(0, Number(e.weight) || 0);
+    return { address, weight: weighting === "even" ? 1 : raw };
+  });
+
+  const n = entries.length;
   const base = {
     reburnSat,
     profitSat,
     poolSat,
     eligibleCount: n,
     shareSat: "0",
+    perWeightSat: "0",
     recipients: [],
     selfKeptSat: "0",
     carryOutSat: poolSat,
+    weighting,
+    totalWeight: 0,
+    skippedBelowMin: 0,
   };
   if (n === 0 || cmpSats(poolSat, "0") <= 0) return base;
 
-  const share = (BigInt(poolSat) / BigInt(n)).toString();
-  if (cmpSats(share, minPayoutSat) < 0) return base; // pool too small — carry it all
+  const totalWeight = entries.reduce((sum, e) => sum + e.weight, 0);
+  if (totalWeight <= 0) return base; // nobody was present long enough to earn
 
-  const recipients = eligible.filter((a) => a !== selfAddress).map((address) => ({ address, amountSat: share }));
-  const selfKeptSat = eligible.includes(selfAddress) ? share : "0";
-  // The share×n floor remainder carries; self's share stays in the wallet.
-  const carryOutSat = subSats(poolSat, (BigInt(share) * BigInt(n)).toString());
-  return { ...base, shareSat: share, recipients, selfKeptSat, carryOutSat };
+  const pool = BigInt(poolSat);
+  const W = BigInt(totalWeight);
+  const recipients = [];
+  let selfKeptSat = "0";
+  let distributed = 0n;
+  let skippedBelowMin = 0;
+  let topShare = 0n;
+
+  for (const e of entries) {
+    const amount = (pool * BigInt(e.weight)) / W; // floor; remainder carries
+    // A share below the minimum is not worth a transaction — each payout spends
+    // mana 1:1. It carries into the next cycle instead of being dusted away.
+    if (amount <= 0n || cmpSats(amount.toString(), minPayoutSat) < 0) {
+      skippedBelowMin += 1;
+      continue;
+    }
+    distributed += amount;
+    if (amount > topShare) topShare = amount;
+    if (e.address === selfAddress) selfKeptSat = amount.toString();
+    else recipients.push({ address: e.address, amountSat: amount.toString() });
+  }
+
+  return {
+    ...base,
+    // What one tick of presence was worth, and the largest share paid (they are
+    // the same figure when every node was present the whole window).
+    perWeightSat: (pool / W).toString(),
+    shareSat: topShare.toString(),
+    recipients,
+    selfKeptSat,
+    carryOutSat: (pool - distributed).toString(),
+    totalWeight,
+    skippedBelowMin,
+  };
 }
 
 // Which transactions to attempt this tick, given what mana/liquid allow.
@@ -301,6 +394,7 @@ class DistributionEngine {
       lastScannedHeight: null, // network snapshot progress
       seen: {},                // { [producer]: { blocks, lastSeenHeight, lastSeenMs } }
       aiSeen: {},              // { [address]: { reads, firstSeenMs, lastSeenMs } }
+      ticks: 0,                // presence samples taken this cycle
       // Roster reads this cycle. `accepted`/`rejected` count addresses, not
       // reads: a roster that answers happily but only ever returns unusable
       // addresses (a display endpoint that truncates them, say) must be
@@ -314,6 +408,7 @@ class DistributionEngine {
     };
     st.seen ??= {};
     st.aiSeen ??= {};
+    st.ticks ??= 0;
     st.aiReads ??= { ok: 0, failed: 0, accepted: 0, rejected: 0, lastError: null };
     st.aiReads.accepted ??= 0;
     st.aiReads.rejected ??= 0;
@@ -419,7 +514,7 @@ class DistributionEngine {
         if (headHeight - from + 1 > MAX_SCAN_BLOCKS) from = headHeight - MAX_SCAN_BLOCKS + 1;
         if (from <= headHeight) {
           const { headers } = await this.chain.blockHeaders(from, headHeight);
-          mergeSeen(st.seen, headers);
+          mergeSeen(st.seen, headers, now);
           st.lastScannedHeight = headHeight;
         }
       }
@@ -453,6 +548,16 @@ class DistributionEngine {
           st.aiReads.lastError = rosterError;
         }
       }
+    }
+
+    // One presence sample per check. Producers are stamped with the first and
+    // last tick they were alive for; the span between those is what a share is
+    // proportional to, so a node that turns up in the final ten minutes earns
+    // a final-ten-minutes share rather than a full one.
+    st.ticks += 1;
+    for (const rec of Object.values(st.seen)) {
+      if (rec.firstTick == null) rec.firstTick = st.ticks;
+      if (now - (rec.lastObservedMs || 0) <= PRESENCE_WINDOW_MS) rec.lastTick = st.ticks;
     }
 
     // Close the cycle when the daily boundary has passed — but never while the
@@ -576,13 +681,31 @@ class DistributionEngine {
       }));
     }
 
+    // Turn the qualifying addresses into weighted entries: how much of the
+    // window each was actually present for.
+    const weighted = eligible.map((address) => {
+      const p = st.seen[address];
+      const span = p && p.firstTick != null && p.lastTick != null ? p.lastTick - p.firstTick + 1 : 0;
+      return {
+        address,
+        weight: participationWeight({
+          producerSpanTicks: span,
+          aiTicks: st.aiSeen[address]?.reads ?? 0,
+          totalTicks: st.ticks,
+          requireVhpMinimum: cfg.requireVhpMinimum,
+          requireAiNode: cfg.requireAiNode,
+        }),
+      };
+    });
+
     const settle = settleCycle({
       periodRewardsSat,
       periodVhpConsumedSat,
       carrySat: st.carry,
-      eligible,
+      eligible: weighted,
       selfAddress,
       minPayoutSat: parseAmount(cfg.minPayoutKoin),
+      weighting: cfg.weighting,
     });
 
     if (cmpSats(settle.reburnSat, "0") > 0) st.reburnOwed = addSats(st.reburnOwed, settle.reburnSat);
@@ -597,6 +720,11 @@ class DistributionEngine {
       pool: settle.poolSat,
       reburn: settle.reburnSat,
       share: settle.shareSat,
+      perWeight: settle.perWeightSat,
+      weighting: settle.weighting,
+      totalWeight: settle.totalWeight,
+      ticks: st.ticks,
+      skippedBelowMin: settle.skippedBelowMin,
       eligibleCount: settle.eligibleCount,
       recipientCount: settle.recipients.length,
       selfKept: settle.selfKeptSat,
@@ -625,6 +753,7 @@ class DistributionEngine {
     st.anchor = { rewards: statsRes.totals.rewards, vhpConsumed: statsRes.totals.vhpConsumed };
     st.seen = {};
     st.aiSeen = {};
+    st.ticks = 0;
     st.aiReads = { ok: 0, failed: 0, accepted: 0, rejected: 0, lastError: null };
     st.cycleStartedAt = now;
     st.lastClosedAt = now;
@@ -708,6 +837,7 @@ class DistributionEngine {
           vhpConsumed: v,
           profit: cmpSats(r, v) > 0 ? subSats(r, v) : "0",
           seenCount: Object.keys(st.seen).length,
+          ticks: st.ticks,
           aiSeenCount: Object.keys(st.aiSeen).length,
           aiReads: st.aiReads,
         };
@@ -747,6 +877,7 @@ module.exports = {
   mergeSeen,
   mergeAiSeen,
   selectEligible,
+  participationWeight,
   settleCycle,
   planTick,
 };

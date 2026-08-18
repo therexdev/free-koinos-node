@@ -2427,6 +2427,11 @@ function renderDistributionView() {
             <span><b>Running Koinos AI Node</b> <span class="muted small">— must be seen on the Koinos AI network</span></span></label>
           <p class="hint" id="di-rule" style="margin-top:8px"></p>
         </div>
+        <label class="field"><span>How the pool is split</span>
+          <select id="di-weighting">
+            <option value="participation" ${cfg.weighting !== "even" ? "selected" : ""}>\u23f1\ufe0f By participation — share \u221d how much of the window a node was present</option>
+            <option value="even" ${cfg.weighting === "even" ? "selected" : ""}>\u2696\ufe0f Evenly — a flat split among everyone who qualified</option>
+          </select></label>
         <label class="field" id="di-minvhp-wrap" style="display:${cfg.requireVhpMinimum ? "block" : "none"}"><span>Minimum VHP a node needs to qualify</span>
           <input id="di-minvhp" type="text" class="mono" value="${esc(cfg.minVhpKoin)}"></label>
         <label class="field" id="di-roster-wrap" style="display:${cfg.requireAiNode ? "block" : "none"}"><span>Koinos AI Node roster URL</span>
@@ -2444,7 +2449,8 @@ function renderDistributionView() {
           <button id="di-now" class="btn">Check now</button>
           <button id="di-close" class="btn">Distribute now</button>
         </div>
-        <p class="hint">Every share is equal — a node with ten times the minimum VHP gets the same as one right at it. Your own node counts as one of the eligible nodes and simply keeps its share. If the even share would be below the minimum, the whole pool carries into the next day instead.</p>
+        <p class="hint">Stake never buys a bigger share — a node with ten times the minimum VHP earns the same as one right at it. What does count is <b>time present</b>: with participation weighting, a node is credited for the span it was actually seen during the window, so one that appears in the last ten minutes earns a last-ten-minutes share rather than a full one — even when a large pool has rolled over. Your own node counts as one of the eligible nodes and simply keeps its share.</p>
+        <p class="hint">Presence is measured by span, not block count, so a node at the VHP minimum that produces rarely is not penalised against a large producer. Any share below the minimum is skipped and carried rather than sent, because each payout spends mana.</p>
         <p class="hint">With <b>Running Koinos AI Node</b> on, the roster URL decides who is credited — point it only at a roster you trust. If the roster can't be read at any point during a day, that day pays nobody and carries the whole pool over (the VHP reburn still happens).</p>
         <p class="hint">Payouts are signed locally, so the app must be open with the wallet unlocked. Sending and reburning KOIN spend <b>mana</b> — big distributions drain out in chunks as mana recharges. Enabling this turns off the Reward-returns tab (they'd both spend the same rewards).</p>
       </div>
@@ -2455,7 +2461,7 @@ function renderDistributionView() {
     </div>
     <div class="card">
       <h2>🧾 Distribution cycles</h2>
-      <table><thead><tr><th>Closed</th><th>Profit</th><th>Reburned</th><th>Nodes</th><th>Share each</th><th>Carried</th></tr></thead>
+      <table><thead><tr><th>Closed</th><th>Profit</th><th>Reburned</th><th>Nodes</th><th>Top share</th><th>Carried</th></tr></thead>
       <tbody id="di-history"></tbody></table>
     </div>
     <div class="card">
@@ -2494,6 +2500,7 @@ async function onSaveDistribution() {
   try {
     await call("distribution:configure", {
       enabled: $("#di-enabled").checked,
+      weighting: $("#di-weighting").value,
       requireVhpMinimum: $("#di-req-vhp").checked,
       requireAiNode: $("#di-req-ai").checked,
       aiRosterUrl: $("#di-roster").value.trim(),
@@ -2592,8 +2599,14 @@ function patchDistributionView() {
               ? `<span class="pill accent">AI node</span>`
               : `<span class="pill">any producer</span>`
       }</span></div>
+    <div class="row spread"><span class="muted">Split</span>
+      <span class="small">${r.config.weighting === "even"
+        ? `<span class="pill">evenly</span>`
+        : `<span class="pill accent">by participation</span>`}</span></div>
     <div class="row spread"><span class="muted">Producers seen this cycle</span>
       <span class="mono">${c ? c.seenCount : "—"}</span></div>
+    <div class="row spread"><span class="muted">Presence samples taken</span>
+      <span class="mono">${c ? c.ticks ?? 0 : "—"}</span></div>
     ${r.config.requireAiNode
       ? `<div class="row spread"><span class="muted">AI nodes seen this cycle</span>
       <span class="mono">${c ? c.aiSeenCount : "—"}${c?.aiReads ? ` <span class="muted small">(${c.aiReads.ok} ok / ${c.aiReads.failed} failed)</span>` : ""}</span></div>

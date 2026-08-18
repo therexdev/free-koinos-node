@@ -145,6 +145,11 @@ const DEFAULT_SETTINGS = {
   // satisfy both. See selectEligible() in distribution.js.
   distribution: {
     enabled: false,
+    // "participation" pays each node in proportion to how much of the window it
+    // was actually present for, so a node appearing at the last minute cannot
+    // collect a full share of a day's (or a rolled-over week's) rewards.
+    // "even" is a flat split among everyone who qualified at settlement.
+    weighting: "participation",
     requireVhpMinimum: true,  // gate 1: producing AND holding >= minVhpKoin
     requireAiNode: false,     // gate 2: seen running a Koinos AI Node
     minVhpKoin: "10000",      // a node qualifies with at least this much VHP
