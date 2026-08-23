@@ -132,6 +132,23 @@ never distributed.
 | Minimum share to pay out | 0.5 KOIN | Below this the day's pool carries to the next day |
 | Check every | 10 min | Snapshot + queue-draining interval |
 
+## Node value in USD
+
+The dashboard values the node — liquid KOIN plus VHP — at KOIN's live USD price,
+alongside daily, weekly and yearly earnings estimates.
+
+The price is quoted from the **Uniswap v4 USDT/vKOIN pool** on Ethereum (vKOIN
+is Vortex-bridged KOIN at 1:1), which is the same pool the Fund tab swaps
+through — so a node is valued at a rate it could actually be traded at. The
+quote is cached for five minutes, and a failed refresh keeps the last known
+price, flagged stale, rather than blanking the figures.
+
+**Daily is measured; weekly and yearly are projections.** Daily comes from the
+rolling profit rate the dashboard already tracks; weekly and yearly are that
+rate times 7 and 365. They assume network conditions and price hold, which they
+will not — treat them as a run-rate, not a forecast. With no price available
+every USD figure reads "—" rather than zero.
+
 ## Switching over from Koinos Node Desktop
 
 Your existing producer key works here unchanged — either way, the node you

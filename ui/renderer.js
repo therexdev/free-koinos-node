@@ -63,6 +63,15 @@ function fmtPct(v) {
   return v.toLocaleString(undefined, { minimumFractionDigits: digits, maximumFractionDigits: digits }) + "%";
 }
 
+// USD for display. Small prices (a fraction of a cent) need more places than
+// a dollar figure does, so scale the precision to the magnitude.
+function fmtUsd(v, { price = false } = {}) {
+  if (v == null || !isFinite(v)) return "—";
+  const abs = Math.abs(v);
+  const digits = price ? (abs < 0.01 ? 6 : abs < 1 ? 4 : 2) : abs < 1 ? 2 : abs < 1000 ? 2 : 0;
+  return "$" + v.toLocaleString(undefined, { minimumFractionDigits: digits, maximumFractionDigits: digits });
+}
+
 function shortTx(txId) {
   const s = String(txId ?? "");
   return s.length > 18 ? `${s.slice(0, 10)}…${s.slice(-6)}` : s;
@@ -220,6 +229,8 @@ function renderDashboardView() {
     </div>
     <div class="widget-grid" id="d-tiles"></div>
     <div class="card">
+      <div class="row spread"><h2>🏦 Node value</h2><span class="muted small" id="d-value-note"></span></div>
+      <div class="widget-grid" id="d-value"></div>
       <div class="row spread"><h2>💵 Profit &amp; projected return</h2><span class="muted small" id="d-returns-note"></span></div>
       <div class="widget-grid" id="d-returns"></div>
     </div>
@@ -330,6 +341,25 @@ function patchDashboardView() {
   } else if (ret && ret.yearlyProfitReburnSats) {
     yearlyReburn = fmtSat(ret.yearlyProfitReburnSats, 2) + " " + symbol;
   }
+  // Node value + USD earnings, priced off the Uniswap USDT/vKOIN pool.
+  const nv = d.nodeValue || null;
+  const px = d.price || null;
+  const valueTiles = [
+    tile("Node value", nv ? fmtUsd(nv.total) : "—", symbol + " + VHP at market", "accent"),
+    tile("Daily", nv ? fmtUsd(nv.daily) : "—", "at the current rate", "good"),
+    tile("Weekly", nv ? fmtUsd(nv.weekly) : "—", "projected, 7 × daily", "good"),
+    tile("Yearly", nv ? fmtUsd(nv.yearly) : "—", "projected, 365 × daily", "good"),
+    tile(symbol + " price", px && px.usd != null ? fmtUsd(px.usd, { price: true }) : "—", "USDT/vKOIN pool"),
+  ];
+  $("#d-value").innerHTML = valueTiles.join("");
+  $("#d-value-note").textContent = !px || px.usd == null
+    ? `price unavailable${px && px.error ? ` — ${px.error}` : ""}`
+    : px.stale
+      ? `last price ${fmtTime(px.at)} — refresh failed, may be out of date`
+      : px.source === "demo"
+        ? "demo price"
+        : `weekly and yearly are projections from the recent daily rate, not measured earnings`;
+
   const returnTiles = [
     tile("Daily profit", w ? fmtSat(w.last24h, 4) : "—", "last 24h", "good"),
     tile("Weekly profit", w ? fmtSat(w.last7d, 4) : "—", "last 7 days", "good"),

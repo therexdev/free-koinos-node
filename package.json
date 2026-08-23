@@ -1,7 +1,7 @@
 {
   "name": "free-koinos-node",
   "productName": "Free Koinos Node",
-  "version": "0.5.1",
+  "version": "0.6.0",
   "description": "Desktop app that runs a block-producing Koinos node and, instead of keeping block rewards, redistributes the profit evenly to every producing node on the network with enough VHP \u2014 reburning the rest to keep its own VHP level",
   "main": "electron/main.js",
   "private": true,

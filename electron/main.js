@@ -29,6 +29,7 @@ const { vkoinBalance, quoteVkoinSend, maxVkoinSendable, sendVkoin } = require(".
 const { quoteSwap } = require("./lib/koindx");
 const { quoteEthToVkoin, quoteVkoinOut, applySlippage } = require("./lib/eth-swap");
 const { compareRoutes, descriptor } = require("./lib/fund-routes");
+const { KoinPrice, nodeValueUsd } = require("./lib/koin-price");
 
 // Shared Coinbase Onramp endpoint + app-identity key (see onramp-endpoint/). At
 // module scope so both the IPC handlers and the bridge orchestrator use them.
@@ -129,6 +130,8 @@ if (!gotLock) {
       onEvent: sendEvent,
     });
     const stats = new ProducerStats({ chain, state });
+    // KOIN's USD price, quoted from the Uniswap USDT/vKOIN pool (cached).
+    const koinPrice = new KoinPrice({ makeProvider });
     const rewards = new RewardEngine({ chain, wallet, settings, state, stats, onEvent: sendEvent });
     rewards.start();
     const distribution = new DistributionEngine({ chain, wallet, settings, state, stats, onEvent: sendEvent });
@@ -169,7 +172,7 @@ if (!gotLock) {
       }
     }, 8000);
 
-    registerIpc({ settings, state, wallet, chain, nodeMgr, setup, rewards, distribution, stats, bridge, routeC, userData });
+    registerIpc({ settings, state, wallet, chain, nodeMgr, setup, rewards, distribution, stats, koinPrice, bridge, routeC, userData });
     createWindow();
     setupAutoUpdates();
 
@@ -230,7 +233,7 @@ function setupAutoUpdates() {
   setInterval(check, 4 * 60 * 60 * 1000);
 }
 
-function registerIpc({ settings, state, wallet, chain, nodeMgr, setup, rewards, distribution, stats, bridge, routeC, userData }) {
+function registerIpc({ settings, state, wallet, chain, nodeMgr, setup, rewards, distribution, stats, koinPrice, bridge, routeC, userData }) {
   const handle = (channel, fn) =>
     ipcMain.handle(channel, async (_evt, payload) => {
       try {
@@ -510,6 +513,26 @@ function registerIpc({ settings, state, wallet, chain, nodeMgr, setup, rewards, 
       ? projectReturns({ avgDailyProfitSats: windows.avgDailyProfit, stakeSats, reburnFraction })
       : null;
 
+    // What the node is worth, and what it earns, in USD. Priced off the same
+    // Uniswap pool the Fund tab swaps through — the rate it could actually be
+    // traded at. Never blocks the dashboard: a failed or slow quote leaves the
+    // last known price in place (flagged stale) and the tiles simply show "—".
+    let price = null;
+    try {
+      price = await koinPrice.get();
+    } catch {
+      price = koinPrice.cached();
+    }
+    out.price = price
+      ? { usd: price.usd, at: price.at, stale: !!price.stale, source: price.source }
+      : { usd: null, error: koinPrice.lastError };
+    out.nodeValue = nodeValueUsd({
+      koinSats: balances && !balances.error ? balances.koin : "0",
+      vhpSats: stakeSats,
+      avgDailyProfitSats: windows ? windows.avgDailyProfit : "0",
+      usdPerKoin: price?.usd ?? null,
+    });
+
     // Screenshot/demo-only override (never set in production): present a
     // running, synced node with representative balances so marketing shots
     // show a live dashboard.
@@ -525,6 +548,11 @@ function registerIpc({ settings, state, wallet, chain, nodeMgr, setup, rewards, 
       const demoWindows = { last24h: "31200000", last7d: "216500000", last30d: "934800000", avgDailyProfit: "31160000", daysTracked: 30 };
       out.stats = { available: true, network: net.id, totals: out.stats?.totals ?? null, feed: out.stats?.feed ?? [], windows: demoWindows, syncing: false };
       out.returns = projectReturns({ avgDailyProfitSats: demoWindows.avgDailyProfit, stakeSats: out.balances.vhp, reburnFraction: 0.5 });
+      out.price = { usd: 0.062, at: Date.now(), stale: false, source: "demo" };
+      out.nodeValue = nodeValueUsd({
+        koinSats: out.balances.koin, vhpSats: out.balances.vhp,
+        avgDailyProfitSats: demoWindows.avgDailyProfit, usdPerKoin: 0.062,
+      });
     }
     return out;
   });
