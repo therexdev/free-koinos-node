@@ -2,7 +2,7 @@
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { KoinPrice, koinUsdFrom, valueUsd, nodeValueUsd, assertSaneUsd } = require("../electron/lib/koin-price");
+const { KoinPrice, koinUsdFrom, midPriceFrom, valueUsd, nodeValueUsd, assertSaneUsd } = require("../electron/lib/koin-price");
 
 const USDT = (n) => BigInt(Math.round(n * 1e6));   // 6 decimals
 const KOIN = (n) => String(BigInt(Math.round(n * 1e8))); // 8 decimals
@@ -30,6 +30,33 @@ test("implausible prices are refused rather than displayed", () => {
   assert.throws(() => assertSaneUsd(0), /plausible/);
   assert.throws(() => assertSaneUsd(NaN), /plausible/);
   assert.throws(() => assertSaneUsd(Infinity), /plausible/);
+});
+
+// ---------- mid price ----------
+
+test("the mid of a buy and a sell cancels the pool fee and price impact", () => {
+  // A buy quote reads HIGH: it pays the pool's 1% fee plus the probe's impact.
+  // Observed live: the app read $0.0090736 while a mid-price feed showed
+  // $0.008928 — 1.63% high, almost exactly the 1% fee plus ~0.6% impact.
+  const mid = 0.008928;
+  const buy = 0.0090736;
+  const sell = (mid * mid) / buy; // the other side, same distance from mid
+  near(midPriceFrom({ buy, sell }), mid, 1e-9);
+
+  // Symmetric costs cancel whatever their size.
+  near(midPriceFrom({ buy: 0.01 * 1.05, sell: 0.01 / 1.05 }), 0.01, 1e-12);
+  assert.throws(() => midPriceFrom({ buy: 0.01, sell: 0 }), /positive/);
+  assert.throws(() => midPriceFrom({ buy: 0, sell: 0.01 }), /positive/);
+});
+
+test("a live-sized node values correctly at the mid", () => {
+  // 36,275.56 KOIN+VHP, as reported from a running node.
+  const total = 36275.56;
+  const v = nodeValueUsd({
+    koinSats: "0", vhpSats: String(BigInt(Math.round(total * 1e8))),
+    avgDailyProfitSats: "0", usdPerKoin: 0.008928,
+  });
+  near(v.total, 323.87, 0.01); // vs $329.15 on the one-sided buy price
 });
 
 // ---------- valuing the node ----------

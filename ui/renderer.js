@@ -349,7 +349,8 @@ function patchDashboardView() {
     tile("Daily", nv ? fmtUsd(nv.daily) : "—", "at the current rate", "good"),
     tile("Weekly", nv ? fmtUsd(nv.weekly) : "—", "projected, 7 × daily", "good"),
     tile("Yearly", nv ? fmtUsd(nv.yearly) : "—", "projected, 365 × daily", "good"),
-    tile(symbol + " price", px && px.usd != null ? fmtUsd(px.usd, { price: true }) : "—", "USDT/vKOIN pool"),
+    tile(symbol + " price", px && px.usd != null ? fmtUsd(px.usd, { price: true }) : "—",
+      px && px.method === "buy-only" ? "USDT/vKOIN buy quote" : "USDT/vKOIN mid price"),
   ];
   $("#d-value").innerHTML = valueTiles.join("");
   $("#d-value-note").textContent = !px || px.usd == null

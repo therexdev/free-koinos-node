@@ -42,6 +42,20 @@ function koinUsdFrom({ usdtIn, koinOut }) {
   return usdtUnits / koinUnits;
 }
 
+// The mid price between an executable buy and an executable sell.
+//
+// A single buy quote is not the market price: it includes the pool's fee (1% on
+// this pool) plus the price impact of the probe, so it reads HIGH — about 1.6%
+// above a mid-price feed at a 100 USDT probe. Both costs are symmetric, so
+// quoting in both directions and taking the geometric mean cancels them and
+// lands on the mid. Geometric, not arithmetic: the costs are multiplicative.
+function midPriceFrom({ buy, sell }) {
+  const b = Number(buy);
+  const s = Number(sell);
+  if (!(b > 0) || !(s > 0)) throw new Error("both directions need a positive quote");
+  return Math.sqrt(b * s);
+}
+
 function assertSaneUsd(usd) {
   if (!Number.isFinite(usd) || usd < MIN_USD || usd > MAX_USD) {
     throw new Error(`KOIN price out of plausible range (${usd})`);
@@ -128,22 +142,49 @@ class KoinPrice {
     const provider = await this.makeProvider();
     const k = RC.VKOIN_USDT_POOL;
     const quoter = new ethers.Contract(RC.V4_QUOTER, V4_QUOTER_ABI, provider);
-    // USDT is currency1 in this pool, so buying vKOIN is zeroForOne = false.
-    const r = await quoter.quoteExactInputSingle.staticCall({
-      poolKey: {
-        currency0: k.currency0,
-        currency1: k.currency1,
-        fee: k.fee,
-        tickSpacing: k.tickSpacing,
-        hooks: k.hooks,
-      },
-      zeroForOne: false,
-      exactAmount: this.probeUsdt,
-      hookData: "0x",
-    });
-    const usd = assertSaneUsd(koinUsdFrom({ usdtIn: this.probeUsdt, koinOut: r[0] }));
-    return { usd, at: Date.now(), probeUsdt: this.probeUsdt.toString(), source: "uniswap-v4-usdt-vkoin" };
+    const poolKey = {
+      currency0: k.currency0,
+      currency1: k.currency1,
+      fee: k.fee,
+      tickSpacing: k.tickSpacing,
+      hooks: k.hooks,
+    };
+    const quote = async (zeroForOne, exactAmount) => {
+      const r = await quoter.quoteExactInputSingle.staticCall({
+        poolKey,
+        zeroForOne,
+        exactAmount,
+        hookData: "0x",
+      });
+      return BigInt(r[0]);
+    };
+
+    // Buy: USDT in, vKOIN out. USDT is currency1, so zeroForOne = false.
+    const koinOut = await quote(false, this.probeUsdt);
+    const buy = koinUsdFrom({ usdtIn: this.probeUsdt, koinOut });
+
+    // Sell the same vKOIN straight back for the other side of the spread. If
+    // this leg fails we still have a usable (if slightly high) buy price, so
+    // degrade to it rather than losing the reading entirely.
+    let usd = buy;
+    let method = "buy-only";
+    try {
+      const usdtBack = await quote(true, koinOut);
+      const sell = koinUsdFrom({ usdtIn: usdtBack, koinOut });
+      usd = midPriceFrom({ buy, sell });
+      method = "mid";
+    } catch {
+      /* one-sided price it is */
+    }
+
+    return {
+      usd: assertSaneUsd(usd),
+      at: Date.now(),
+      probeUsdt: this.probeUsdt.toString(),
+      method,
+      source: "uniswap-v4-usdt-vkoin",
+    };
   }
 }
 
-module.exports = { KoinPrice, koinUsdFrom, valueUsd, nodeValueUsd, assertSaneUsd, PROBE_USDT, CACHE_MS };
+module.exports = { KoinPrice, koinUsdFrom, midPriceFrom, valueUsd, nodeValueUsd, assertSaneUsd, PROBE_USDT, CACHE_MS };

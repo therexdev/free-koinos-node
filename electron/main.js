@@ -524,7 +524,7 @@ function registerIpc({ settings, state, wallet, chain, nodeMgr, setup, rewards, 
       price = koinPrice.cached();
     }
     out.price = price
-      ? { usd: price.usd, at: price.at, stale: !!price.stale, source: price.source }
+      ? { usd: price.usd, at: price.at, stale: !!price.stale, source: price.source, method: price.method }
       : { usd: null, error: koinPrice.lastError };
     out.nodeValue = nodeValueUsd({
       koinSats: balances && !balances.error ? balances.koin : "0",

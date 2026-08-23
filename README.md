@@ -139,9 +139,15 @@ alongside daily, weekly and yearly earnings estimates.
 
 The price is quoted from the **Uniswap v4 USDT/vKOIN pool** on Ethereum (vKOIN
 is Vortex-bridged KOIN at 1:1), which is the same pool the Fund tab swaps
-through — so a node is valued at a rate it could actually be traded at. The
-quote is cached for five minutes, and a failed refresh keeps the last known
-price, flagged stale, rather than blanking the figures.
+through. The quote is cached for five minutes, and a failed refresh keeps the
+last known price, flagged stale, rather than blanking the figures.
+
+It quotes **both directions and takes the mid**. A single buy quote is not the
+market price: it pays the pool's 1% fee plus the probe's price impact, which
+read about 1.6% high against a mid-price feed in practice. Buying and selling
+cost the same in each direction, so the geometric mean of the two cancels both
+and lands on the mid. If the sell leg fails the buy-only price is used instead,
+and the tile says so.
 
 **Daily is measured; weekly and yearly are projections.** Daily comes from the
 rolling profit rate the dashboard already tracks; weekly and yearly are that
