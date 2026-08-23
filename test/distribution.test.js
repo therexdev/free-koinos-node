@@ -297,6 +297,46 @@ test("a share below the minimum is skipped and carried, not dusted out", () => {
   assert.ok(BigInt(s.carryOutSat) > 0n); // blip's slice rolls forward
 });
 
+test("a skipped node keeps its credit and is paid once it accumulates", () => {
+  // The starvation case: a small or newly-joined node's share lands below the
+  // minimum, so it is skipped — but the big node IS paid. If the skip also wiped
+  // the small node's credit it would restart at zero every cycle and never cross
+  // the minimum, while the share it earned quietly went to the big node.
+  const s1 = settleCycle({
+    periodRewardsSat: KOIN(10), periodVhpConsumedSat: "0",
+    eligible: [{ address: "big", weight: KOIN(90) }, { address: "small", weight: KOIN(10) }],
+    selfAddress: "SELF", minPayoutSat: KOIN(2), carrySat: "0",
+  });
+  // big takes 9, small's 1 is under the 2 minimum -> skipped and carried.
+  assert.deepEqual(s1.recipients.map((r) => r.address), ["big"]);
+  assert.equal(s1.skippedBelowMin, 1);
+  assert.deepEqual(s1.paidAddresses, ["big"]); // ONLY big's credit is settled
+  assert.equal(s1.carryOutSat, KOIN(1));
+
+  // Next cycle: big's credit was cleared and re-earned, small's carried and grew.
+  const s2 = settleCycle({
+    periodRewardsSat: KOIN(10), periodVhpConsumedSat: "0", carrySat: s1.carryOutSat,
+    eligible: [{ address: "big", weight: KOIN(90) }, { address: "small", weight: KOIN(20) }],
+    selfAddress: "SELF", minPayoutSat: KOIN(2),
+  });
+  const paid = Object.fromEntries(s2.recipients.map((r) => [r.address, r.amountSat]));
+  assert.ok(paid.small, "small must now be paid rather than skipped again");
+  assert.equal(paid.small, "200000000"); // 20/110 of the 11 KOIN pool = 2 KOIN
+  assert.deepEqual(s2.paidAddresses.sort(), ["big", "small"]);
+});
+
+test("paidAddresses names exactly who settled, self included", () => {
+  const s = settleCycle({
+    periodRewardsSat: KOIN(10), periodVhpConsumedSat: "0",
+    eligible: [{ address: "SELF", weight: KOIN(50) }, { address: "other", weight: KOIN(50) }],
+    selfAddress: "SELF", minPayoutSat: KOIN(1), carrySat: "0",
+  });
+  // SELF keeps its share rather than transferring, but its credit is still settled.
+  assert.deepEqual(s.recipients.map((r) => r.address), ["other"]);
+  assert.equal(s.selfKeptSat, KOIN(5));
+  assert.deepEqual(s.paidAddresses.sort(), ["SELF", "other"]);
+});
+
 test("nobody earned any credit -> the whole pool carries", () => {
   const s = settleCycle({
     periodRewardsSat: KOIN(110), periodVhpConsumedSat: KOIN(100),

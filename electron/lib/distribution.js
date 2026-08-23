@@ -248,6 +248,7 @@ function settleCycle({
     shareSat: "0",
     perWeightSat: "0",
     recipients: [],
+    paidAddresses: [],
     selfKeptSat: "0",
     carryOutSat: poolSat,
     weighting,
@@ -262,6 +263,7 @@ function settleCycle({
   const pool = BigInt(poolSat);
   const totalWeight = W.toString();
   const recipients = [];
+  const paidAddresses = []; // exactly who got their credit settled this cycle
   let selfKeptSat = "0";
   let distributed = 0n;
   let skippedBelowMin = 0;
@@ -270,12 +272,14 @@ function settleCycle({
   for (const e of entries) {
     const amount = (pool * e.weight) / W; // floor; remainder carries
     // A share below the minimum is not worth a transaction — each payout spends
-    // mana 1:1. It carries into the next cycle instead of being dusted away.
+    // mana 1:1. It carries into the next cycle instead of being dusted away,
+    // and so does the credit that earned it (see the reset in _closeCycle).
     if (amount <= 0n || cmpSats(amount.toString(), minPayoutSat) < 0) {
       skippedBelowMin += 1;
       continue;
     }
     distributed += amount;
+    paidAddresses.push(e.address);
     if (amount > topShare) topShare = amount;
     if (e.address === selfAddress) selfKeptSat = amount.toString();
     else recipients.push({ address: e.address, amountSat: amount.toString() });
@@ -288,6 +292,7 @@ function settleCycle({
     perWeightSat: (pool / W).toString(),
     shareSat: topShare.toString(),
     recipients,
+    paidAddresses,
     selfKeptSat,
     carryOutSat: (pool - distributed).toString(),
     totalWeight,
@@ -787,13 +792,15 @@ class DistributionEngine {
     st.seen = {};
     st.aiSeen = {};
     st.ticks = 0;
-    // Credits are cleared only when the pool was ACTUALLY paid out. A cycle
-    // that paid nobody carries its money forward, so it must carry the record
-    // of who earned that money too — otherwise the next cycle would hand a
-    // rolled-over pool to whoever happens to be around then.
-    if (settle.recipients.length > 0 || cmpSats(settle.selfKeptSat, "0") > 0) {
-      st.credits = {};
-    }
+    // Clear ONLY the credit that was actually settled. Wiping every credit
+    // whenever anyone got paid quietly starved small and newly-joined nodes:
+    // their share lands below the minimum payout, so they are skipped — and
+    // then their credit is deleted anyway because somebody else was paid. They
+    // restart from zero every cycle, never accumulate enough to cross the
+    // minimum, and the share they earned is absorbed by the larger nodes.
+    // Keeping a skipped node's credit lets it build across cycles until it does
+    // cross, which is the whole point of carrying the money forward with it.
+    for (const address of settle.paidAddresses ?? []) delete st.credits[address];
     st.aiReads = { ok: 0, failed: 0, accepted: 0, rejected: 0, lastError: null };
     st.cycleStartedAt = now;
     st.lastClosedAt = now;
