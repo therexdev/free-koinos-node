@@ -30,6 +30,7 @@ const { quoteSwap } = require("./lib/koindx");
 const { quoteEthToVkoin, quoteVkoinOut, applySlippage } = require("./lib/eth-swap");
 const { compareRoutes, descriptor } = require("./lib/fund-routes");
 const { KoinPrice, nodeValueUsd } = require("./lib/koin-price");
+const { LastGood } = require("./lib/last-good");
 
 // Shared Coinbase Onramp endpoint + app-identity key (see onramp-endpoint/). At
 // module scope so both the IPC handlers and the bridge orchestrator use them.
@@ -234,6 +235,9 @@ function setupAutoUpdates() {
 }
 
 function registerIpc({ settings, state, wallet, chain, nodeMgr, setup, rewards, distribution, stats, koinPrice, bridge, routeC, userData }) {
+  // Dashboard reads that must not blank on a hiccup (see lib/last-good.js).
+  const dashHold = new LastGood();
+
   const handle = (channel, fn) =>
     ipcMain.handle(channel, async (_evt, payload) => {
       try {
@@ -315,7 +319,10 @@ function registerIpc({ settings, state, wallet, chain, nodeMgr, setup, rewards, 
   handle("chain:balances", async () => {
     const address = wallet.address;
     if (!address) return { address: null };
-    const b = await chain.balances(address);
+    // Same hold as the dashboard: the wallet and burn tabs poll this, and a
+    // one-off RPC failure should not empty the balances on screen.
+    const b = await dashHold.run(`balances.${chain.network().id}.${address}`, () => chain.balances(address));
+    if (b.error) throw new Error(b.error);
     return {
       address,
       ...b,
@@ -496,8 +503,11 @@ function registerIpc({ settings, state, wallet, chain, nodeMgr, setup, rewards, 
     }
     if (!address) return out;
     // Balances + producer stats (both hit the RPC).
+    // Both hold their last good answer through a failure rather than reporting
+    // nothing: the dashboard polls every few seconds, and a blank tile that
+    // refills on the next tick reads as a glitch, not as an outage.
     const [balances, statsRes] = await Promise.all([
-      chain.balances(address).catch((e) => ({ error: String(e.message) })),
+      dashHold.run(`balances.${net.id}.${address}`, () => chain.balances(address)),
       stats.refresh(address).catch((e) => ({ available: false, error: String(e.message) })),
     ]);
     out.balances = balances;

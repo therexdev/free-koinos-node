@@ -2,7 +2,7 @@
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { ChainService } = require("../electron/lib/chain");
+const { ChainService, localNodeUsable } = require("../electron/lib/chain");
 
 const LOCAL = "http://127.0.0.1:8080";
 const PUBLIC = "https://api.koinos.io";
@@ -73,4 +73,28 @@ test("a single-endpoint provider keeps koilib's abort-on-error default", () => {
   const p = c.provider();
   assert.equal(p.rpcNodes.length, 1);
   assert.equal(p.onError(new Error("boom")), true);
+});
+
+// --- health hysteresis -------------------------------------------------
+// A node whose head sits near the cutoff must not be adopted and dropped on
+// alternating probes: that swaps the endpoint list every 30s and makes the
+// dashboard disagree with itself between polls.
+
+test("our node is adopted only when it is clearly caught up", () => {
+  assert.equal(localNodeUsable(false, 5 * 1000), true);        // right behind head
+  assert.equal(localNodeUsable(false, 90 * 1000), true);       // a minute and a half
+  assert.equal(localNodeUsable(false, 3 * 60 * 1000), false);  // too far behind to adopt
+});
+
+test("a node already in use is kept through a wobble past the adopt line", () => {
+  assert.equal(localNodeUsable(true, 3 * 60 * 1000), true);    // would not be adopted, but is kept
+  assert.equal(localNodeUsable(true, 4 * 60 * 1000), true);
+  assert.equal(localNodeUsable(true, 6 * 60 * 1000), false);   // genuinely behind — drop it
+});
+
+test("the adopt and drop lines do not coincide", () => {
+  // The gap between them is the flap guard; if it ever closes this test fails.
+  const at = 150 * 1000; // between the two thresholds
+  assert.equal(localNodeUsable(false, at), false);
+  assert.equal(localNodeUsable(true, at), true);
 });

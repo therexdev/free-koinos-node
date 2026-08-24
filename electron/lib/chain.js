@@ -31,7 +31,17 @@ const CONTRACT_NAMES = ["koin", "vhp", "pob"];
 const RESOLVE_TTL_MS = 60 * 60 * 1000;
 const LOCAL_PROBE_TTL_MS = 30 * 1000;      // how often to re-check our own node
 const LOCAL_SYNC_TOLERANCE_MS = 2 * 60 * 1000; // head this fresh counts as caught up
+const LOCAL_DROP_TOLERANCE_MS = 5 * 60 * 1000; // and this stale before we stop using it
 const FAILOVER_WINDOW_MS = 15 * 1000;      // window for one rotation through the endpoints
+
+// Should we (still) route through our own node, given how far its head is
+// behind? Hysteresis: it has to be clearly caught up to be adopted, but only
+// clearly behind to be dropped. With a single threshold, a head hovering around
+// it flips the endpoint list on every probe, so consecutive dashboard polls hit
+// different endpoints and disagree — which on screen looks like flickering.
+function localNodeUsable(wasUp, behindMs) {
+  return behindMs < (wasUp ? LOCAL_DROP_TOLERANCE_MS : LOCAL_SYNC_TOLERANCE_MS);
+}
 
 class ChainService {
   constructor(settings) {
@@ -109,7 +119,7 @@ class ChainService {
         try {
           const head = await new Provider([net.localRpcUrl]).getHeadInfo();
           const headMs = Number(head?.head_block_time ?? 0);
-          up = Date.now() - headMs < LOCAL_SYNC_TOLERANCE_MS;
+          up = localNodeUsable(st.up, Date.now() - headMs);
         } catch {
           up = false;
         }
@@ -214,10 +224,13 @@ class ChainService {
         this._contract("koin", { provider }),
         this._contract("vhp", { provider }),
       ]);
+      // Mana is read, not defaulted: swallowing a failed rc call as "0" makes
+      // an RPC hiccup look like an empty mana bar, which stalls the payout
+      // queue and turns a send into a bogus "not enough mana" error.
       const [k, v, rc] = await Promise.all([
         koin.functions.balance_of({ owner: address }),
         vhp.functions.balance_of({ owner: address }),
-        provider.getAccountRc(address).catch(() => "0"),
+        provider.getAccountRc(address),
       ]);
       return {
         koin: k?.result?.value ?? "0",
@@ -492,4 +505,4 @@ class ChainService {
   }
 }
 
-module.exports = { ChainService };
+module.exports = { ChainService, localNodeUsable };

@@ -155,6 +155,16 @@ rate times 7 and 365. They assume network conditions and price hold, which they
 will not — treat them as a run-rate, not a forecast. With no price available
 every USD figure reads "—" rather than zero.
 
+### Readings hold through a hiccup
+
+The dashboard polls the chain every few seconds. When a poll fails — an RPC
+timeout, the node restarting mid-request — the last good figures stay on screen
+and the timestamp reads *reconnecting…*, instead of every tile emptying to "—"
+and refilling on the next tick. Readings are held for up to ten minutes; past
+that they clear, because a ten-minute-old balance is no longer worth showing.
+Mana is read the same way rather than defaulting to zero, so a failed call can
+never look like an empty mana bar.
+
 ## Switching over from Koinos Node Desktop
 
 Your existing producer key works here unchanged — either way, the node you

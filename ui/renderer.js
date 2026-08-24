@@ -21,6 +21,8 @@ const S = {
   distribution: null, // distribution:status
   dashboard: null,    // dashboard:summary
   dashboardRendered: false,
+  dashboardBusy: null,  // in-flight refresh, so overlapping polls coalesce
+  dashboardStaleAt: 0,  // when the last refresh failed (0 = last one succeeded)
   view: "dashboard",
   walletStage: null,  // "none" | "locked" | "unlocked"
   pendingWif: null,   // shown once after create
@@ -159,7 +161,8 @@ async function refreshBalances(force = false) {
     S.balancesAt = Date.now();
     patchBalances();
   } catch (e) {
-    S.balances = { error: e.message };
+    // Hold the last good reading rather than emptying the tab on one bad poll.
+    S.balances = S.balances && !S.balances.error ? { ...S.balances, stale: true } : { error: e.message };
     patchBalances();
   }
 }
@@ -200,14 +203,31 @@ async function refreshDistribution() {
 
 // ---------- dashboard ----------
 
+// The dashboard is refreshed by the 5s heartbeat, by every main-process event
+// and by navigation, so several refreshes can be in flight at once — and a slow
+// failing one landing after a fast good one would blank what was just drawn.
+// Coalesce them: while a refresh is running, other callers wait on it.
 async function refreshDashboard() {
+  if (S.dashboardBusy) return S.dashboardBusy;
+  const run = (async () => {
+    try {
+      S.dashboard = await call("dashboard:summary");
+      S.dashboardStaleAt = 0;
+    } catch (e) {
+      // Keep the last good summary on screen. One failed poll should show as
+      // "reconnecting", not as every number vanishing for five seconds.
+      if (!S.dashboard || S.dashboard.error) S.dashboard = { error: e.message };
+      else S.dashboardStaleAt = Date.now();
+    }
+    if (!S.dashboardRendered) renderDashboardView();
+    patchDashboardView();
+  })();
+  S.dashboardBusy = run;
   try {
-    S.dashboard = await call("dashboard:summary");
-  } catch (e) {
-    S.dashboard = { error: e.message };
+    await run;
+  } finally {
+    S.dashboardBusy = null;
   }
-  if (!S.dashboardRendered) renderDashboardView();
-  patchDashboardView();
 }
 
 function renderDashboardView() {
@@ -243,12 +263,33 @@ function renderDashboardView() {
     const el = e.target.closest("[data-tx]");
     if (el) openTx(el.dataset.tx);
   });
+  painted.clear(); // the DOM above is brand new; nothing painted survives
   S.dashboardRendered = true;
 }
 
 function tile(label, value, sub, cls) {
   return `<div class="tile ${cls || ""}"><div class="t-label">${esc(label)}</div>
     <div class="t-value">${value}</div><div class="t-sub">${esc(sub || "")}</div></div>`;
+}
+
+// Repaint only what actually changed. The dashboard redraws every few seconds;
+// reassigning innerHTML unconditionally rebuilds every tile — restarting CSS
+// transitions, dropping any text selection and making steady numbers flicker.
+const painted = new Map();
+function setHtml(sel, html) {
+  if (painted.get(sel) === html) return;
+  const el = $(sel);
+  if (!el) return;
+  painted.set(sel, html);
+  el.innerHTML = html;
+}
+function setText(sel, text) {
+  const key = "#text" + sel;
+  if (painted.get(key) === text) return;
+  const el = $(sel);
+  if (!el) return;
+  painted.set(key, text);
+  el.textContent = text;
 }
 
 function patchDashboardView() {
@@ -292,16 +333,15 @@ function patchDashboardView() {
   }
   toggle.disabled = false;
 
-  const syncEl = $("#d-sync");
   const sync = d.sync;
   if (running && sync && !sync.local?.error) {
     const pct = sync.progressPct != null ? sync.progressPct : sync.inSync ? 100 : 0;
-    syncEl.innerHTML = `<div class="row spread" style="margin-top:12px">
+    setHtml("#d-sync", `<div class="row spread" style="margin-top:12px">
       <span>${sync.inSync ? '<span class="pill good">in sync</span>' : '<span class="pill warn">syncing</span>'}</span>
       <span class="mono small">${sync.local.height.toLocaleString()}${sync.remote ? " / " + sync.remote.height.toLocaleString() : ""} blocks</span></div>
-      <div class="progress" style="margin-top:6px"><div style="width:${Math.min(100, pct).toFixed(1)}%"></div></div>`;
+      <div class="progress" style="margin-top:6px"><div style="width:${Math.min(100, pct).toFixed(1)}%"></div></div>`);
   } else {
-    syncEl.innerHTML = "";
+    setHtml("#d-sync", "");
   }
 
   // stat tiles
@@ -321,7 +361,7 @@ function patchDashboardView() {
     tile("Total burned", totals ? fmtSat(totals.burned, 4) : "—", symbol + " → VHP"),
     tile("Deposits in", totals ? fmtSat(totals.depositsIn, 4) : "—", symbol + " received"),
   ];
-  $("#d-tiles").innerHTML = tiles.join("");
+  setHtml("#d-tiles", tiles.join(""));
 
   // profit windows + projected return
   const w = st && st.windows ? st.windows : null;
@@ -352,14 +392,14 @@ function patchDashboardView() {
     tile(symbol + " price", px && px.usd != null ? fmtUsd(px.usd, { price: true }) : "—",
       px && px.method === "buy-only" ? "USDT/vKOIN buy quote" : "USDT/vKOIN mid price"),
   ];
-  $("#d-value").innerHTML = valueTiles.join("");
-  $("#d-value-note").textContent = !px || px.usd == null
+  setHtml("#d-value", valueTiles.join(""));
+  setText("#d-value-note", !px || px.usd == null
     ? `price unavailable${px && px.error ? ` — ${px.error}` : ""}`
     : px.stale
       ? `last price ${fmtTime(px.at)} — refresh failed, may be out of date`
       : px.source === "demo"
         ? "demo price"
-        : `weekly and yearly are projections from the recent daily rate, not measured earnings`;
+        : `weekly and yearly are projections from the recent daily rate, not measured earnings`);
 
   const returnTiles = [
     tile("Daily profit", w ? fmtSat(w.last24h, 4) : "—", "last 24h", "good"),
@@ -368,32 +408,34 @@ function patchDashboardView() {
     tile("Yearly return", yearlyCurrent, yearlyCurrentSub, "accent"),
     tile("Yearly + reburn", yearlyReburn, yearlyReburnSub, "accent"),
   ];
-  $("#d-returns").innerHTML = returnTiles.join("");
-  $("#d-returns-note").textContent = !w
+  setHtml("#d-returns", returnTiles.join(""));
+  setText("#d-returns-note", !w
     ? ""
     : st.syncing
       ? "history syncing — longer windows still catching up"
       : w.daysTracked > 0 && w.daysTracked < 30
         ? `based on ${w.daysTracked} day${w.daysTracked === 1 ? "" : "s"} of history`
-        : "";
+        : "");
 
   // feed
-  const feedEl = $("#d-feed");
-  const note = $("#d-feed-note");
   if (!d.wallet.exists) {
-    feedEl.innerHTML = `<span class="muted small">Create a wallet (Wallet tab) to see activity.</span>`;
-    note.textContent = "";
+    setHtml("#d-feed", `<span class="muted small">Create a wallet (Wallet tab) to see activity.</span>`);
+    setText("#d-feed-note", "");
   } else if (!st) {
-    feedEl.innerHTML = `<span class="muted small">Activity history isn't available on ${esc(d.network.label)} — it needs a history RPC (works on mainnet).</span>`;
-    note.textContent = "";
+    setHtml("#d-feed", `<span class="muted small">Activity history isn't available on ${esc(d.network.label)} — it needs a history RPC (works on mainnet).</span>`);
+    setText("#d-feed-note", "");
   } else if (!st.feed.length) {
-    feedEl.innerHTML = `<span class="muted small">No activity yet. When your node produces a block, it appears here.</span>`;
-    note.textContent = st.syncing ? "syncing…" : "";
+    setHtml("#d-feed", `<span class="muted small">No activity yet. When your node produces a block, it appears here.</span>`);
+    setText("#d-feed-note", st.syncing ? "syncing…" : "");
   } else {
-    note.textContent = st.syncing ? "totals still syncing…" : "";
-    feedEl.innerHTML = st.feed.map((f) => feedRow(symbol, f)).join("");
+    setText("#d-feed-note", st.syncing ? "totals still syncing…" : "");
+    setHtml("#d-feed", st.feed.map((f) => feedRow(symbol, f)).join(""));
   }
-  $("#d-updated").textContent = st && st.updatedAt ? "updated " + new Date(st.updatedAt).toLocaleTimeString() : "";
+  // A held-over reading is labelled rather than hidden: the figures stay put,
+  // and the timestamp says they stopped moving.
+  const stale = S.dashboardStaleAt || (st && st.stale) || (d.balances && d.balances.stale);
+  const at = st && st.updatedAt ? "updated " + new Date(st.updatedAt).toLocaleTimeString() : "";
+  setText("#d-updated", stale ? (at ? at + " · reconnecting…" : "reconnecting…") : at);
 }
 
 function feedRow(symbol, f) {
@@ -815,7 +857,11 @@ function patchBalances() {
     setText("#bal-vhp", fmtSat(b.vhp, 4));
     setText("#bal-mana", fmtSat(b.mana, 4));
     const note = $("#bal-note");
-    if (note) note.textContent = `Updated ${new Date(S.balancesAt).toLocaleTimeString()}`;
+    if (note) {
+      note.textContent = b.stale
+        ? `Updated ${new Date(S.balancesAt).toLocaleTimeString()} · reconnecting…`
+        : `Updated ${new Date(S.balancesAt).toLocaleTimeString()}`;
+    }
   }
   patchBurnBalances();
 }

@@ -78,6 +78,14 @@ class ProducerStats {
     try {
       latest = await this.chain.getAccountHistory(address, { limit: FEED_FETCH, ascending: false });
     } catch (e) {
+      // A history endpoint that times out on one poll must not blank the
+      // dashboard: serve the cached snapshot, flagged stale. Only a cold
+      // failure — nothing ever fetched for this address — is "unavailable",
+      // which is also what a network without a history RPC looks like.
+      const cached = this.get(networkId, address);
+      if (cached && cached.updatedAt) {
+        return { network: networkId, available: true, ...cached, stale: true, error: String(e.message) };
+      }
       return { network: networkId, available: false, error: String(e.message) };
     }
     const s = this._load(key);
