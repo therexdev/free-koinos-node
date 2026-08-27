@@ -5,11 +5,15 @@ const assert = require("node:assert/strict");
 const {
   DistributionEngine,
   validateDistributionConfig,
+  migrateDistributionConfig,
+  activeDimensions,
   nextCycleClose,
   mergeSeen,
   mergeAiSeen,
-  selectEligible,
+  tierFor,
+  classifyCandidates,
   settleCycle,
+  previewSplit,
   planTick,
 } = require("../electron/lib/distribution");
 
@@ -19,31 +23,77 @@ const KOIN = (n) => String(BigInt(n) * 100000000n);
 
 test("validateDistributionConfig normalizes and rejects bad values", () => {
   const cfg = validateDistributionConfig({
-    enabled: 1, requireVhpMinimum: 1, requireAiNode: 0, aiRosterUrl: "",
+    enabled: 1, aiRosterUrl: "", reburnPct: "25",
+    sharePct: { aiOnly: "10", vhpOnly: 20, both: 30 },
     minVhpKoin: "10000", payoutHourUtc: "3", minPayoutKoin: "0.5", pollMinutes: "15",
   });
   assert.deepEqual(cfg, {
     enabled: true, weighting: "participation",
-    requireVhpMinimum: true, requireAiNode: false, aiRosterUrl: "",
-    minVhpKoin: "10000", payoutHourUtc: 3, minPayoutKoin: "0.5", pollMinutes: 15,
+    reburnPct: 25, sharePct: { aiOnly: 10, vhpOnly: 20, both: 30 },
+    aiRosterUrl: "", minVhpKoin: "10000", payoutHourUtc: 3, minPayoutKoin: "0.5", pollMinutes: 15,
   });
-  assert.throws(() => validateDistributionConfig({ weighting: "sideways", minVhpKoin: "1", payoutHourUtc: 0, minPayoutKoin: "1", pollMinutes: 10 }), /weighting/);
-  // A blank roster URL stays allowed with the AI gate on (the engine fails
+  const base = { sharePct: { aiOnly: 0, vhpOnly: 100, both: 0 }, minVhpKoin: "1", payoutHourUtc: 0, minPayoutKoin: "1", pollMinutes: 10 };
+  assert.throws(() => validateDistributionConfig({ ...base, weighting: "sideways" }), /weighting/);
+  // A blank roster URL stays allowed with an AI group funded (the engine fails
   // closed at settlement instead), but a malformed one is rejected on save.
   assert.equal(
-    validateDistributionConfig({ requireAiNode: true, aiRosterUrl: "", minVhpKoin: "1", payoutHourUtc: 0, minPayoutKoin: "1", pollMinutes: 10 }).aiRosterUrl,
+    validateDistributionConfig({ ...base, sharePct: { aiOnly: 100, vhpOnly: 0, both: 0 }, aiRosterUrl: "" }).aiRosterUrl,
     ""
   );
-  assert.throws(() => validateDistributionConfig({ aiRosterUrl: "not a url", minVhpKoin: "1", payoutHourUtc: 0, minPayoutKoin: "1", pollMinutes: 10 }), /valid URL|https/);
-  assert.throws(() => validateDistributionConfig({ aiRosterUrl: "http://evil.example/roster", minVhpKoin: "1", payoutHourUtc: 0, minPayoutKoin: "1", pollMinutes: 10 }), /https/);
-  assert.throws(() => validateDistributionConfig({ minVhpKoin: "0", payoutHourUtc: 0, minPayoutKoin: "1", pollMinutes: 10 }), /Minimum VHP/);
-  assert.throws(() => validateDistributionConfig({ minVhpKoin: "x", payoutHourUtc: 0, minPayoutKoin: "1", pollMinutes: 10 }), /Invalid amount/);
-  assert.throws(() => validateDistributionConfig({ minVhpKoin: "10000", payoutHourUtc: 24, minPayoutKoin: "1", pollMinutes: 10 }), /hour/);
-  assert.throws(() => validateDistributionConfig({ minVhpKoin: "10000", payoutHourUtc: 2.5, minPayoutKoin: "1", pollMinutes: 10 }), /hour/);
-  assert.throws(() => validateDistributionConfig({ minVhpKoin: "10000", payoutHourUtc: 0, minPayoutKoin: "-1", pollMinutes: 10 }), /Invalid amount/);
-  assert.throws(() => validateDistributionConfig({ minVhpKoin: "10000", payoutHourUtc: 0, minPayoutKoin: "1", pollMinutes: 0 }), /interval/);
-  // "0" minimum payout is allowed (pay any share, however small)
-  assert.equal(validateDistributionConfig({ minVhpKoin: "1", payoutHourUtc: 0, minPayoutKoin: "0", pollMinutes: 10 }).minPayoutKoin, "0");
+  assert.throws(() => validateDistributionConfig({ ...base, aiRosterUrl: "not a url" }), /valid URL|https/);
+  assert.throws(() => validateDistributionConfig({ ...base, aiRosterUrl: "http://evil.example/roster" }), /https/);
+  assert.throws(() => validateDistributionConfig({ ...base, minVhpKoin: "x" }), /Invalid amount/);
+  assert.throws(() => validateDistributionConfig({ ...base, payoutHourUtc: 24 }), /hour/);
+  assert.throws(() => validateDistributionConfig({ ...base, payoutHourUtc: 2.5 }), /hour/);
+  assert.throws(() => validateDistributionConfig({ ...base, minPayoutKoin: "-1" }), /Invalid amount/);
+  assert.throws(() => validateDistributionConfig({ ...base, pollMinutes: 0 }), /interval/);
+  // "0" minimum payout is allowed (pay any share, however small), and a "0"
+  // VHP minimum now means "any producer counts".
+  assert.equal(validateDistributionConfig({ ...base, minPayoutKoin: "0" }).minPayoutKoin, "0");
+  assert.equal(validateDistributionConfig({ ...base, minVhpKoin: "0" }).minVhpKoin, "0");
+});
+
+test("the percentages can't promise more of the profit than exists", () => {
+  const base = { minVhpKoin: "1", payoutHourUtc: 0, minPayoutKoin: "1", pollMinutes: 10 };
+  assert.throws(
+    () => validateDistributionConfig({ ...base, reburnPct: 50, sharePct: { aiOnly: 20, vhpOnly: 20, both: 20 } }),
+    /110%/
+  );
+  // Exactly 100% is fine, and so is leaving a remainder for the wallet.
+  assert.equal(
+    validateDistributionConfig({ ...base, reburnPct: 40, sharePct: { aiOnly: 10, vhpOnly: 20, both: 30 } }).reburnPct, 40
+  );
+  const short = validateDistributionConfig({ ...base, reburnPct: 10, sharePct: { aiOnly: 0, vhpOnly: 10, both: 10 } });
+  assert.equal(short.reburnPct + short.sharePct.aiOnly + short.sharePct.vhpOnly + short.sharePct.both, 30);
+});
+
+// ---------- upgrading from the two on/off gates ----------
+
+test("the old gates migrate to percentages that pay exactly the same people", () => {
+  const legacy = (requireVhpMinimum, requireAiNode) =>
+    migrateDistributionConfig({ requireVhpMinimum, requireAiNode, minVhpKoin: "10000" });
+
+  // VHP gate only -> the producing group takes the whole pool, and because no
+  // AI group is funded the roster is never consulted (so an AI operator that
+  // produces is still just a producer).
+  assert.deepEqual(legacy(true, false).sharePct, { aiOnly: 0, vhpOnly: 100, both: 0 });
+  assert.equal(activeDimensions(legacy(true, false).sharePct).aiActive, false);
+  // AI gate only -> the AI group takes it, production irrelevant.
+  assert.deepEqual(legacy(false, true).sharePct, { aiOnly: 100, vhpOnly: 0, both: 0 });
+  assert.equal(activeDimensions(legacy(false, true).sharePct).produceActive, false);
+  // Both gates -> only the group that satisfies both.
+  assert.deepEqual(legacy(true, true).sharePct, { aiOnly: 0, vhpOnly: 0, both: 100 });
+  // Neither gate meant "every producer, whatever its VHP" — which is now a
+  // producing group with a zero minimum.
+  const none = legacy(false, false);
+  assert.deepEqual(none.sharePct, { aiOnly: 0, vhpOnly: 100, both: 0 });
+  assert.equal(none.minVhpKoin, "0");
+  // The old keys are gone once migrated, so they can't contradict the new ones.
+  assert.equal("requireVhpMinimum" in none, false);
+  assert.equal("requireAiNode" in none, false);
+  // Already-migrated config is left exactly as it is.
+  const current = { sharePct: { aiOnly: 5, vhpOnly: 10, both: 15 }, minVhpKoin: "10000", reburnPct: 20 };
+  assert.deepEqual(migrateDistributionConfig(current).sharePct, current.sharePct);
 });
 
 // ---------- daily boundary ----------
@@ -83,82 +133,108 @@ test("mergeAiSeen records every address the roster reported", () => {
   assert.equal(ai.B.reads, 1);
 });
 
-// ---------- the eligibility matrix (the two checkboxes) ----------
+// ---------- who lands in which group ----------
 
-// Four candidates covering every interesting combination of signals.
 const CANDIDATES = [
   { address: "produces-rich",  producing: true,  aiNode: false, vhpSat: KOIN(50000) },
   { address: "produces-poor",  producing: true,  aiNode: false, vhpSat: KOIN(500) },
   { address: "ai-and-mines",   producing: true,  aiNode: true,  vhpSat: KOIN(10000) },
   { address: "ai-only",        producing: false, aiNode: true,  vhpSat: "0" },
 ];
-const matrix = (requireVhpMinimum, requireAiNode) =>
-  selectEligible({ candidates: CANDIDATES, requireVhpMinimum, requireAiNode, minVhpSat: KOIN(10000) }).eligible;
+const groups = (sharePct, minVhpSat = KOIN(10000)) =>
+  classifyCandidates(CANDIDATES, { minVhpSat, ...activeDimensions(sharePct) }).tiers;
 
-test("neither box: every node seen producing earns a share", () => {
-  assert.deepEqual(matrix(false, false), ["produces-rich", "produces-poor", "ai-and-mines"]);
+test("with only the producing group funded, the roster is not consulted at all", () => {
+  // An AI operator that produces is simply a producer — turning the AI groups
+  // to zero must never disqualify anyone from a group that IS funded.
+  const t = groups({ aiOnly: 0, vhpOnly: 100, both: 0 });
+  assert.deepEqual(t.vhpOnly, ["produces-rich", "ai-and-mines"]);
+  assert.deepEqual(t.both, []);
+  assert.deepEqual(t.aiOnly, []);
 });
 
-test("VHP only: producing nodes at or above the minimum", () => {
-  // "produces-poor" is below the 10k line; "ai-only" never produced a block.
-  assert.deepEqual(matrix(true, false), ["produces-rich", "ai-and-mines"]);
+test("with only the AI group funded, block production and VHP are irrelevant", () => {
+  const t = groups({ aiOnly: 100, vhpOnly: 0, both: 0 });
+  assert.deepEqual(t.aiOnly, ["ai-and-mines", "ai-only"]);
+  assert.deepEqual(t.vhpOnly, []);
 });
 
-test("AI only: anyone seen on an AI node, block production irrelevant", () => {
-  assert.deepEqual(matrix(false, true), ["ai-and-mines", "ai-only"]);
+test("fund any two and the three groups partition everyone, exactly once each", () => {
+  const t = groups({ aiOnly: 10, vhpOnly: 20, both: 30 });
+  assert.deepEqual(t.both, ["ai-and-mines"]);      // produces with the stake AND on the roster
+  assert.deepEqual(t.vhpOnly, ["produces-rich"]);  // produces with the stake, not on the roster
+  assert.deepEqual(t.aiOnly, ["ai-only"]);         // on the roster, not producing with the stake
+  // produces-poor is below the minimum and on no roster: no group at all.
+  const all = [...t.both, ...t.vhpOnly, ...t.aiOnly];
+  assert.equal(new Set(all).size, all.length);
+  assert.equal(all.includes("produces-poor"), false);
 });
 
-test("both boxes: must be on an AI node AND mining with the minimum VHP", () => {
-  assert.deepEqual(matrix(true, true), ["ai-and-mines"]);
+test("a zero VHP minimum makes every producer count, stake unread", () => {
+  const t = groups({ aiOnly: 0, vhpOnly: 100, both: 0 }, "0");
+  assert.deepEqual(t.vhpOnly, ["produces-rich", "produces-poor", "ai-and-mines"]);
 });
 
 test("exactly at the minimum VHP qualifies (>=, not >)", () => {
-  const { eligible } = selectEligible({
-    candidates: [{ address: "edge", producing: true, aiNode: true, vhpSat: KOIN(10000) }],
-    requireVhpMinimum: true, requireAiNode: false, minVhpSat: KOIN(10000),
-  });
-  assert.deepEqual(eligible, ["edge"]);
+  assert.equal(
+    tierFor({ producing: true, aiNode: false, vhpSat: KOIN(10000) },
+      { minVhpSat: KOIN(10000), produceActive: true, aiActive: false }),
+    "vhpOnly"
+  );
 });
 
-test("an unreadable VHP balance is never assumed to qualify", () => {
-  const { eligible, rejected } = selectEligible({
-    candidates: [{ address: "unknown", producing: true, aiNode: true, vhpSat: null }],
-    requireVhpMinimum: true, requireAiNode: false, minVhpSat: KOIN(10000),
-  });
-  assert.deepEqual(eligible, []);
+test("an unreadable VHP balance is never assumed to meet the minimum", () => {
+  const { tiers, rejected } = classifyCandidates(
+    [{ address: "unknown", producing: true, aiNode: true, vhpSat: null }],
+    { minVhpSat: KOIN(10000), produceActive: true, aiActive: false }
+  );
+  assert.deepEqual(tiers.vhpOnly, []);
   assert.equal(rejected.vhpUnknown, 1);
 });
 
 test("rejection reasons are tallied for the UI", () => {
-  const { rejected } = selectEligible({
-    candidates: CANDIDATES, requireVhpMinimum: true, requireAiNode: true, minVhpSat: KOIN(10000),
+  const { rejected } = classifyCandidates(CANDIDATES, {
+    minVhpSat: KOIN(10000), produceActive: true, aiActive: false,
   });
-  assert.equal(rejected.notProducing, 1); // ai-only
   assert.equal(rejected.belowVhp, 1);     // produces-poor
-  assert.equal(rejected.notAiNode, 1);    // produces-rich
+  assert.equal(rejected.notProducing, 1); // ai-only
 });
 
 // ---------- cycle settlement ----------
 
-const settleBase = { carrySat: "0", selfAddress: "SELF", minPayoutSat: KOIN(1) };
+const NO_CARRY = { both: "0", vhpOnly: "0", aiOnly: "0" };
+const ALL_TO_PRODUCERS = { aiOnly: 0, vhpOnly: 100, both: 0 };
+
+// Most scenarios below are about the split itself rather than about groups, so
+// they fund one group and put everyone in it. `credits` is { address: satoshis }.
+const settleOne = (credits, extra = {}) =>
+  settleCycle({
+    periodVhpConsumedSat: "0",
+    carry: NO_CARRY,
+    credits: { both: {}, aiOnly: {}, vhpOnly: credits },
+    selfAddress: "SELF",
+    minPayoutSat: KOIN(1),
+    sharePct: ALL_TO_PRODUCERS,
+    ...extra,
+  });
+// An equal-credit ledger, for the cases where the weighting isn't the point.
+const flat = (addresses) => Object.fromEntries(addresses.map((a) => [a, KOIN(1)]));
 
 test("the headline case: 100 KOIN profit over 10 nodes -> 10 KOIN each", () => {
-  const eligible = Array.from({ length: 10 }, (_, i) => `N${i}`);
-  const s = settleCycle({
+  const s = settleOne(flat(Array.from({ length: 10 }, (_, i) => `N${i}`)), {
     periodRewardsSat: KOIN(1100), periodVhpConsumedSat: KOIN(1000),
-    eligible, ...settleBase,
   });
   assert.equal(s.reburnSat, KOIN(1000)); // restore the VHP that was consumed
   assert.equal(s.profitSat, KOIN(100));
   assert.equal(s.shareSat, KOIN(10));
-  assert.equal(s.recipients.length, 10); // SELF not among eligible here
+  assert.equal(s.recipients.length, 10); // SELF not among them here
   assert.equal(s.carryOutSat, "0");
+  assert.equal(s.keptSat, "0");          // 100% allocated, nothing left over
 });
 
 test("self counts for the split but keeps its share instead of a transfer", () => {
-  const s = settleCycle({
+  const s = settleOne(flat(["A", "B", "SELF", "C", "D"]), {
     periodRewardsSat: KOIN(110), periodVhpConsumedSat: KOIN(100),
-    eligible: ["A", "B", "SELF", "C", "D"], ...settleBase,
   });
   assert.equal(s.shareSat, KOIN(2)); // 10 profit / 5 nodes
   assert.equal(s.recipients.length, 4);
@@ -168,19 +244,18 @@ test("self counts for the split but keeps its share instead of a transfer", () =
 });
 
 test("integer split: the remainder carries to the next cycle", () => {
-  const s = settleCycle({
+  const s = settleOne(flat(["A", "B", "C"]), {
     periodRewardsSat: KOIN(110), periodVhpConsumedSat: KOIN(100),
-    eligible: ["A", "B", "C"], ...settleBase,
   });
   // 10 KOIN / 3 = 3.33333333 each, 1 sat left over
   assert.equal(s.shareSat, "333333333");
   assert.equal(s.carryOutSat, "1");
+  assert.equal(s.carryOut.vhpOnly, "1"); // and it stays with the group that earned it
 });
 
-test("share below the minimum payout -> whole pool carries", () => {
-  const s = settleCycle({
-    periodRewardsSat: KOIN(101), periodVhpConsumedSat: KOIN(100),
-    eligible: ["A", "B", "C"], ...settleBase, // 1 KOIN / 3 < 1 KOIN minimum
+test("share below the minimum payout -> the group's pool carries", () => {
+  const s = settleOne(flat(["A", "B", "C"]), {
+    periodRewardsSat: KOIN(101), periodVhpConsumedSat: KOIN(100), // 1 KOIN / 3 < 1 minimum
   });
   assert.equal(s.shareSat, "0");
   assert.equal(s.recipients.length, 0);
@@ -188,48 +263,133 @@ test("share below the minimum payout -> whole pool carries", () => {
   assert.equal(s.reburnSat, KOIN(100)); // reburn still happens
 });
 
-test("no eligible nodes -> profit carries, reburn still owed", () => {
-  const s = settleCycle({
-    periodRewardsSat: KOIN(110), periodVhpConsumedSat: KOIN(100),
-    eligible: [], ...settleBase,
-  });
+test("a group nobody was in is never allocated — its slice stays in the wallet", () => {
+  // Carrying it instead would park money for a group that may never exist,
+  // growing a pool that can never be paid.
+  const s = settleOne({}, { periodRewardsSat: KOIN(110), periodVhpConsumedSat: KOIN(100) });
   assert.equal(s.recipients.length, 0);
-  assert.equal(s.carryOutSat, KOIN(10));
+  assert.equal(s.carryOutSat, "0");
+  assert.equal(s.keptSat, KOIN(10));
   assert.equal(s.reburnSat, KOIN(100));
 });
 
-test("carry from earlier cycles joins the pool", () => {
-  const s = settleCycle({
+test("carry from earlier cycles joins its own group's pool", () => {
+  const s = settleOne(flat(["A", "B"]), {
     periodRewardsSat: KOIN(105), periodVhpConsumedSat: KOIN(100),
-    carrySat: KOIN(5), eligible: ["A", "B"], selfAddress: "SELF", minPayoutSat: KOIN(1),
+    carry: { ...NO_CARRY, vhpOnly: KOIN(5) },
   });
   assert.equal(s.poolSat, KOIN(10)); // 5 profit + 5 carried
   assert.equal(s.shareSat, KOIN(5));
 });
 
 test("negative period figures clamp to zero (fresh anchor edge cases)", () => {
-  const s = settleCycle({
-    periodRewardsSat: "-5", periodVhpConsumedSat: "-7",
-    eligible: ["A"], ...settleBase,
-  });
+  const s = settleOne(flat(["A"]), { periodRewardsSat: "-5", periodVhpConsumedSat: "-7" });
   assert.equal(s.reburnSat, "0");
   assert.equal(s.profitSat, "0");
   assert.equal(s.recipients.length, 0);
 });
 
+// ---------- percentage splits (reburn, three groups, the remainder) ----------
+
+const ADDR = { ai: "1AiOnlyNode", vhp: "1ProducerNode", both: "1BothNode" };
+// One address in each group, each with the same credit, so the arithmetic on
+// screen is exactly the configured percentages.
+const threeGroups = (extra = {}) =>
+  settleCycle({
+    periodRewardsSat: KOIN(1100),
+    periodVhpConsumedSat: KOIN(1000), // 100 KOIN profit
+    carry: NO_CARRY,
+    credits: {
+      both: { [ADDR.both]: KOIN(1) },
+      vhpOnly: { [ADDR.vhp]: KOIN(1) },
+      aiOnly: { [ADDR.ai]: KOIN(1) },
+    },
+    selfAddress: "SELF",
+    minPayoutSat: "1",
+    ...extra,
+  });
+
+test("each group is paid its own percentage of the profit", () => {
+  const s = threeGroups({ reburnPct: 40, sharePct: { aiOnly: 10, vhpOnly: 20, both: 30 } });
+  const paid = Object.fromEntries(s.recipients.map((r) => [r.address, r.amountSat]));
+  assert.equal(paid[ADDR.ai], KOIN(10));
+  assert.equal(paid[ADDR.vhp], KOIN(20));
+  assert.equal(paid[ADDR.both], KOIN(30));
+  // 40% of the profit is compounded, on top of restoring the VHP consumed.
+  assert.equal(s.extraReburnSat, KOIN(40));
+  assert.equal(s.levelReburnSat, KOIN(1000));
+  assert.equal(s.reburnSat, KOIN(1040));
+  assert.equal(s.keptSat, "0"); // 40+10+20+30 = 100%
+});
+
+test("what the percentages don't allocate simply stays in the wallet", () => {
+  const s = threeGroups({ reburnPct: 25, sharePct: { aiOnly: 5, vhpOnly: 10, both: 20 } });
+  assert.equal(s.extraReburnSat, KOIN(25));
+  assert.equal(s.tiers.aiOnly.paidSat, KOIN(5));
+  assert.equal(s.tiers.vhpOnly.paidSat, KOIN(10));
+  assert.equal(s.tiers.both.paidSat, KOIN(20));
+  assert.equal(s.keptSat, KOIN(40)); // the other 40% is never queued anywhere
+  assert.equal(s.carryOutSat, "0");
+});
+
+test("a reburn of 100% distributes nothing and compounds the lot", () => {
+  const s = threeGroups({ reburnPct: 100, sharePct: { aiOnly: 0, vhpOnly: 0, both: 0 } });
+  assert.equal(s.reburnSat, KOIN(1100)); // 1000 to stay level + 100 compounded
+  assert.equal(s.recipients.length, 0);
+  assert.equal(s.keptSat, "0");
+});
+
+test("with no percentages set at all the profit is simply kept", () => {
+  const s = threeGroups({ reburnPct: 0, sharePct: { aiOnly: 0, vhpOnly: 0, both: 0 } });
+  assert.equal(s.reburnSat, KOIN(1000)); // VHP still restored
+  assert.equal(s.recipients.length, 0);
+  assert.equal(s.keptSat, KOIN(100));
+});
+
+test("one address in two groups is paid from both, in a single transfer", () => {
+  // Producing all morning, then joining the AI roster, earns credit in two
+  // groups. Both are owed; sending them separately would spend mana twice.
+  const dual = "1DualNode";
+  const s = settleCycle({
+    periodRewardsSat: KOIN(100), periodVhpConsumedSat: "0",
+    carry: NO_CARRY,
+    credits: { both: { [dual]: KOIN(1) }, vhpOnly: { [dual]: KOIN(1) }, aiOnly: {} },
+    selfAddress: "SELF", minPayoutSat: "1",
+    sharePct: { aiOnly: 0, vhpOnly: 30, both: 50 },
+  });
+  assert.equal(s.recipients.length, 1);
+  assert.equal(s.recipients[0].address, dual);
+  assert.equal(s.recipients[0].amountSat, KOIN(80)); // 30% + 50%
+  assert.equal(s.keptSat, KOIN(20));
+});
+
+test("a held group is still allocated, and carries rather than being kept", () => {
+  // The fail-closed guarantee: when the roster couldn't be read, the AI groups
+  // pay nobody — but their share must not quietly become this node's profit.
+  const s = settleCycle({
+    periodRewardsSat: KOIN(100), periodVhpConsumedSat: "0",
+    carry: NO_CARRY,
+    credits: { both: {}, vhpOnly: { "1ProducerNode": KOIN(1) }, aiOnly: {} },
+    selfAddress: "SELF", minPayoutSat: "1",
+    sharePct: { aiOnly: 25, vhpOnly: 25, both: 25 },
+    heldTiers: ["aiOnly", "both"],
+  });
+  assert.equal(s.tiers.vhpOnly.paidSat, KOIN(25)); // the unaffected group pays
+  assert.equal(s.carryOut.aiOnly, KOIN(25));       // held groups carry
+  assert.equal(s.carryOut.both, KOIN(25));
+  assert.equal(s.keptSat, KOIN(25));               // the unallocated quarter
+});
+
 // ---------- credit weighting (the anti-last-minute rule) ----------
 //
 // Every time this node collects a reward, each address qualifying at that
-// moment is credited with it; shares are credit / total credit.
+// moment is credited with it; shares are credit / that group's total credit.
 
 test("the worked example: A alone, then A and B -> 66% / 33%", () => {
   const R = KOIN(1); // one reward interval
   // Reward 1: only A qualifies. Reward 2: A and B both qualify.
-  const credits = { A: (BigInt(R) * 2n).toString(), B: R };
-  const s = settleCycle({
-    periodRewardsSat: KOIN(2), periodVhpConsumedSat: "0",
-    eligible: Object.entries(credits).map(([address, weight]) => ({ address, weight })),
-    selfAddress: "SELF", minPayoutSat: "1", carrySat: "0",
+  const s = settleOne({ A: (BigInt(R) * 2n).toString(), B: R }, {
+    periodRewardsSat: KOIN(2), minPayoutSat: "1",
   });
   const paid = Object.fromEntries(s.recipients.map((r) => [r.address, r.amountSat]));
   // 2 KOIN pool, credits 2:1
@@ -240,15 +400,10 @@ test("the worked example: A alone, then A and B -> 66% / 33%", () => {
 test("the worked example continued: A leaves, C joins -> 40 / 40 / 20", () => {
   const R = BigInt(KOIN(1));
   // Three reward intervals. A: 1,2. B: 2,3. C: 3.
-  const s = settleCycle({
-    periodRewardsSat: KOIN(3), periodVhpConsumedSat: "0",
-    eligible: [
-      { address: "A", weight: (R * 2n).toString() },
-      { address: "B", weight: (R * 2n).toString() },
-      { address: "C", weight: R.toString() },
-    ],
-    selfAddress: "SELF", minPayoutSat: "1", carrySat: "0",
-  });
+  const s = settleOne(
+    { A: (R * 2n).toString(), B: (R * 2n).toString(), C: R.toString() },
+    { periodRewardsSat: KOIN(3), minPayoutSat: "1" }
+  );
   const paid = Object.fromEntries(s.recipients.map((r) => [r.address, r.amountSat]));
   assert.equal(paid.A, "120000000"); // 40% of 3 KOIN
   assert.equal(paid.B, "120000000"); // 40%
@@ -257,27 +412,18 @@ test("the worked example continued: A leaves, C joins -> 40 / 40 / 20", () => {
 
 test("a latecomer earns the rewards it was present for, not a full share", () => {
   const R = BigInt(KOIN(1));
-  const s = settleCycle({
-    periodRewardsSat: KOIN(144), periodVhpConsumedSat: "0",
-    eligible: [
-      { address: "allday", weight: (R * 144n).toString() },
-      { address: "latecomer", weight: (R * 2n).toString() },
-    ],
-    selfAddress: "SELF", minPayoutSat: "1", carrySat: "0",
-  });
+  const s = settleOne(
+    { allday: (R * 144n).toString(), latecomer: (R * 2n).toString() },
+    { periodRewardsSat: KOIN(144), minPayoutSat: "1" }
+  );
   const paid = Object.fromEntries(s.recipients.map((r) => [r.address, r.amountSat]));
   assert.equal(paid.allday, "14202739726");   // 144/146 of the pool
   assert.equal(paid.latecomer, "197260273");  // 2/146 — ~1.97 KOIN, not 72
 });
 
 test("even weighting still ignores credit and splits flat", () => {
-  const s = settleCycle({
-    periodRewardsSat: KOIN(100), periodVhpConsumedSat: "0",
-    eligible: [
-      { address: "allday", weight: KOIN(144) },
-      { address: "latecomer", weight: KOIN(2) },
-    ],
-    selfAddress: "SELF", minPayoutSat: "1", carrySat: "0", weighting: "even",
+  const s = settleOne({ allday: KOIN(144), latecomer: KOIN(2) }, {
+    periodRewardsSat: KOIN(100), minPayoutSat: "1", weighting: "even",
   });
   const paid = Object.fromEntries(s.recipients.map((r) => [r.address, r.amountSat]));
   assert.equal(paid.allday, KOIN(50));
@@ -286,11 +432,7 @@ test("even weighting still ignores credit and splits flat", () => {
 
 test("a share below the minimum is skipped and carried, not dusted out", () => {
   // Paying dust is actively harmful: every payout spends mana 1:1.
-  const s = settleCycle({
-    periodRewardsSat: KOIN(10), periodVhpConsumedSat: "0",
-    eligible: [{ address: "steady", weight: KOIN(144) }, { address: "blip", weight: KOIN(1) }],
-    selfAddress: "SELF", minPayoutSat: KOIN(1), carrySat: "0",
-  });
+  const s = settleOne({ steady: KOIN(144), blip: KOIN(1) }, { periodRewardsSat: KOIN(10) });
   assert.equal(s.recipients.length, 1);
   assert.equal(s.recipients[0].address, "steady");
   assert.equal(s.skippedBelowMin, 1);
@@ -302,49 +444,55 @@ test("a skipped node keeps its credit and is paid once it accumulates", () => {
   // minimum, so it is skipped — but the big node IS paid. If the skip also wiped
   // the small node's credit it would restart at zero every cycle and never cross
   // the minimum, while the share it earned quietly went to the big node.
-  const s1 = settleCycle({
-    periodRewardsSat: KOIN(10), periodVhpConsumedSat: "0",
-    eligible: [{ address: "big", weight: KOIN(90) }, { address: "small", weight: KOIN(10) }],
-    selfAddress: "SELF", minPayoutSat: KOIN(2), carrySat: "0",
+  const s1 = settleOne({ big: KOIN(90), small: KOIN(10) }, {
+    periodRewardsSat: KOIN(10), minPayoutSat: KOIN(2),
   });
   // big takes 9, small's 1 is under the 2 minimum -> skipped and carried.
   assert.deepEqual(s1.recipients.map((r) => r.address), ["big"]);
   assert.equal(s1.skippedBelowMin, 1);
-  assert.deepEqual(s1.paidAddresses, ["big"]); // ONLY big's credit is settled
+  assert.deepEqual(s1.paidAddresses.vhpOnly, ["big"]); // ONLY big's credit is settled
   assert.equal(s1.carryOutSat, KOIN(1));
 
   // Next cycle: big's credit was cleared and re-earned, small's carried and grew.
-  const s2 = settleCycle({
-    periodRewardsSat: KOIN(10), periodVhpConsumedSat: "0", carrySat: s1.carryOutSat,
-    eligible: [{ address: "big", weight: KOIN(90) }, { address: "small", weight: KOIN(20) }],
-    selfAddress: "SELF", minPayoutSat: KOIN(2),
+  const s2 = settleOne({ big: KOIN(90), small: KOIN(20) }, {
+    periodRewardsSat: KOIN(10), minPayoutSat: KOIN(2),
+    carry: { ...NO_CARRY, vhpOnly: s1.carryOut.vhpOnly },
   });
   const paid = Object.fromEntries(s2.recipients.map((r) => [r.address, r.amountSat]));
   assert.ok(paid.small, "small must now be paid rather than skipped again");
   assert.equal(paid.small, "200000000"); // 20/110 of the 11 KOIN pool = 2 KOIN
-  assert.deepEqual(s2.paidAddresses.sort(), ["big", "small"]);
+  assert.deepEqual(s2.paidAddresses.vhpOnly.sort(), ["big", "small"]);
 });
 
-test("paidAddresses names exactly who settled, self included", () => {
-  const s = settleCycle({
-    periodRewardsSat: KOIN(10), periodVhpConsumedSat: "0",
-    eligible: [{ address: "SELF", weight: KOIN(50) }, { address: "other", weight: KOIN(50) }],
-    selfAddress: "SELF", minPayoutSat: KOIN(1), carrySat: "0",
-  });
+test("paidAddresses names exactly who settled, in which group, self included", () => {
+  const s = settleOne({ SELF: KOIN(50), other: KOIN(50) }, { periodRewardsSat: KOIN(10) });
   // SELF keeps its share rather than transferring, but its credit is still settled.
   assert.deepEqual(s.recipients.map((r) => r.address), ["other"]);
   assert.equal(s.selfKeptSat, KOIN(5));
-  assert.deepEqual(s.paidAddresses.sort(), ["SELF", "other"]);
+  assert.deepEqual(s.paidAddresses.vhpOnly.sort(), ["SELF", "other"]);
 });
 
-test("nobody earned any credit -> the whole pool carries", () => {
-  const s = settleCycle({
+test("credit of zero is not credit — the slice is never allocated", () => {
+  const s = settleOne({ ghost: "0" }, {
     periodRewardsSat: KOIN(110), periodVhpConsumedSat: KOIN(100),
-    eligible: [{ address: "ghost", weight: "0" }],
-    selfAddress: "SELF", minPayoutSat: KOIN(1), carrySat: "0",
   });
   assert.equal(s.recipients.length, 0);
-  assert.equal(s.carryOutSat, KOIN(10));
+  assert.equal(s.keptSat, KOIN(10));
+});
+
+// ---------- what the Status panel previews ----------
+
+test("previewSplit shows the same carve-up the cycle will make", () => {
+  const cfg = { reburnPct: 40, sharePct: { aiOnly: 10, vhpOnly: 20, both: 30 } };
+  const p = previewSplit(KOIN(100), cfg);
+  assert.equal(p.reburn, KOIN(40));
+  assert.equal(p.tiers.aiOnly.amount, KOIN(10));
+  assert.equal(p.tiers.vhpOnly.amount, KOIN(20));
+  assert.equal(p.tiers.both.amount, KOIN(30));
+  assert.equal(p.keptPct, 0);
+  const half = previewSplit(KOIN(100), { reburnPct: 10, sharePct: { aiOnly: 0, vhpOnly: 40, both: 0 } });
+  assert.equal(half.keptPct, 50);
+  assert.equal(half.kept, KOIN(50));
 });
 
 // ---------- per-tick planning (mana/liquid chunking) ----------
@@ -756,6 +904,140 @@ test("engine (no gates): every producer seen is paid, VHP never fetched", async 
   assert.equal(res.derived.lastDistribution.eligibleCount, 2);
   assert.equal(world.calls.transfers.length, 2);
   assert.equal(vhpLookups, 0); // gate off -> the balance round-trip is skipped
+});
+
+test("engine: the reburn percentage compounds on top of restoring the VHP", async () => {
+  const totals = { current: { rewards: KOIN(0), vhpConsumed: KOIN(0), blocks: 0 } };
+  const world = makeWorld({
+    totals,
+    headers: [{ height: 1000, timestamp: 3, signer: A }],
+    vhp: { [A]: KOIN(10000) },
+    balances: { koin: KOIN(500), vhp: KOIN(15000), mana: KOIN(400) },
+    cfg: { reburnPct: 40, sharePct: { aiOnly: 0, vhpOnly: 60, both: 0 } },
+  });
+  await world.engine.tick("manual");
+  totals.current = { rewards: KOIN(110), vhpConsumed: KOIN(100), blocks: 10 };
+
+  const res = await world.engine.tick("manual", { forceClose: true });
+  const rec = res.derived.lastDistribution;
+  assert.equal(rec.profit, KOIN(10));
+  assert.equal(rec.levelReburn, KOIN(100)); // what production consumed
+  assert.equal(rec.extraReburn, KOIN(4));   // 40% of the profit, compounded
+  assert.deepEqual(world.calls.burns, [KOIN(104)]);
+  // The other 60% went out; nothing was left over to keep.
+  assert.equal(world.calls.transfers.length, 1);
+  assert.equal(world.calls.transfers[0].amountSat, KOIN(6));
+  assert.equal(rec.kept, "0");
+});
+
+test("engine: unallocated percentage is kept — never burned, never sent", async () => {
+  const totals = { current: { rewards: KOIN(0), vhpConsumed: KOIN(0), blocks: 0 } };
+  const world = makeWorld({
+    totals,
+    headers: [{ height: 1000, timestamp: 3, signer: A }],
+    vhp: { [A]: KOIN(10000) },
+    balances: { koin: KOIN(500), vhp: KOIN(15000), mana: KOIN(400) },
+    cfg: { reburnPct: 10, sharePct: { aiOnly: 0, vhpOnly: 30, both: 0 } },
+  });
+  await world.engine.tick("manual");
+  totals.current = { rewards: KOIN(110), vhpConsumed: KOIN(100), blocks: 10 };
+
+  const res = await world.engine.tick("manual", { forceClose: true });
+  const rec = res.derived.lastDistribution;
+  assert.equal(rec.extraReburn, KOIN(1));
+  assert.deepEqual(world.calls.burns, [KOIN(101)]);
+  assert.equal(world.calls.transfers[0].amountSat, KOIN(3));
+  assert.equal(rec.kept, KOIN(6));      // 60% simply stays in the wallet
+  assert.equal(res.derived.carry, "0"); // and is NOT carried into next cycle
+});
+
+test("engine: the three groups are paid their own percentages", async () => {
+  const totals = { current: { rewards: KOIN(0), vhpConsumed: KOIN(0), blocks: 0 } };
+  const world = makeWorld({
+    totals,
+    headers: [
+      { height: 999, timestamp: 2, signer: A },  // produces + on the roster -> both
+      { height: 1000, timestamp: 3, signer: C }, // produces only            -> vhpOnly
+    ],
+    vhp: { [A]: KOIN(10000), [B]: "0", [C]: KOIN(10000) },
+    balances: { koin: KOIN(5000), vhp: KOIN(15000), mana: KOIN(5000) },
+    cfg: {
+      reburnPct: 20,
+      sharePct: { aiOnly: 10, vhpOnly: 20, both: 50 },
+      aiRosterUrl: "https://kai.example/workers",
+    },
+    roster: [A, B], // B serves AI without producing -> aiOnly
+  });
+  await world.engine.tick("manual");
+  totals.current = { rewards: KOIN(1100), vhpConsumed: KOIN(1000), blocks: 100 };
+
+  const res = await world.engine.tick("manual", { forceClose: true });
+  assert.equal(res.last.outcome, "cycle-closed");
+  const paid = Object.fromEntries(world.calls.transfers.map((t) => [t.to, t.amountSat]));
+  assert.equal(paid[A], KOIN(50)); // both:    50% of 100 KOIN profit
+  assert.equal(paid[C], KOIN(20)); // vhpOnly: 20%
+  assert.equal(paid[B], KOIN(10)); // aiOnly:  10%
+  assert.deepEqual(world.calls.burns, [KOIN(1020)]); // 1000 level + 20% compounded
+  assert.equal(res.derived.lastDistribution.kept, "0");
+});
+
+test("engine: a group with nobody in it doesn't hold up the others", async () => {
+  const totals = { current: { rewards: KOIN(0), vhpConsumed: KOIN(0), blocks: 0 } };
+  const world = makeWorld({
+    totals,
+    headers: [{ height: 1000, timestamp: 3, signer: A }], // producing only
+    vhp: { [A]: KOIN(10000) },
+    balances: { koin: KOIN(500), vhp: KOIN(15000), mana: KOIN(400) },
+    cfg: {
+      sharePct: { aiOnly: 30, vhpOnly: 30, both: 30 },
+      aiRosterUrl: "https://kai.example/workers",
+    },
+    roster: [], // nobody on the AI network at all
+  });
+  await world.engine.tick("manual");
+  totals.current = { rewards: KOIN(110), vhpConsumed: KOIN(100), blocks: 10 };
+
+  const res = await world.engine.tick("manual", { forceClose: true });
+  const rec = res.derived.lastDistribution;
+  assert.equal(world.calls.transfers.length, 1);
+  assert.equal(world.calls.transfers[0].amountSat, KOIN(3)); // A's 30%
+  // The two empty groups were never allocated, so their 60% stays put rather
+  // than accumulating in a pool nobody can ever be paid from.
+  assert.equal(rec.kept, KOIN(7)); // 60% unearned + the 10% never allocated
+  assert.equal(res.derived.carry, "0");
+});
+
+test("engine: pre-0.7 state keeps its carry and credit through the upgrade", async () => {
+  const totals = { current: { rewards: KOIN(100), vhpConsumed: KOIN(100), blocks: 10 } };
+  const world = makeWorld({
+    totals,
+    headers: [{ height: 1000, timestamp: 3, signer: A }],
+    vhp: { [A]: KOIN(10000) },
+    balances: { koin: KOIN(500), vhp: KOIN(15000), mana: KOIN(400) },
+    cfg: { requireVhpMinimum: true, requireAiNode: false }, // the old gates
+  });
+  // A cycle's worth of the old, single-pool state: one flat carry, one flat
+  // credit ledger, both earned before the upgrade.
+  world.state.set(`distribution.mainnet.${SELF}`, {
+    anchor: { rewards: KOIN(100), vhpConsumed: KOIN(100) },
+    cycleStartedAt: Date.now() - 1000,
+    lastClosedAt: null,
+    seen: {}, aiSeen: {}, ticks: 5,
+    credits: { [A]: KOIN(1) },
+    carry: KOIN(4),
+    lastRewardTotal: KOIN(100),
+    vhp: {}, vhpCheckedAt: 0,
+    aiReads: { ok: 0, failed: 0, accepted: 0, rejected: 0, lastError: null },
+    reburnOwed: "0", payouts: [], history: [], actions: [],
+  });
+
+  const res = await world.engine.tick("manual", { forceClose: true });
+  assert.equal(res.last.outcome, "cycle-closed");
+  // The carry and the credit both landed in the producing group, so the money
+  // earned under the old rules is paid to the address that earned it.
+  assert.equal(world.calls.transfers.length, 1);
+  assert.equal(world.calls.transfers[0].to, A);
+  assert.equal(world.calls.transfers[0].amountSat, KOIN(4));
 });
 
 test("engine: a failed payout stays queued and is retried", async () => {

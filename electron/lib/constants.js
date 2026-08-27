@@ -141,26 +141,31 @@ const DEFAULT_SETTINGS = {
     pollMinutes: 10,
   },
   // Community profit distribution: reburn the VHP this node consumes producing
-  // blocks (keeping its VHP level), and split the remaining profit evenly
-  // between every node seen producing on the network with at least minVhpKoin
-  // VHP. Off by default — disabled, the app behaves exactly like Koinos Node
-  // Desktop (keep/compound your own rewards via the Reward-returns tab).
-  // Two independent eligibility gates decide who shares in the pool. Neither
-  // gate on = every node seen producing qualifies; both on = a node must
-  // satisfy both. See selectEligible() in distribution.js.
+  // blocks (keeping its VHP level), then carve up the remaining profit. Off by
+  // default — disabled, the app behaves exactly like Koinos Node Desktop
+  // (keep/compound your own rewards via the Reward-returns tab).
+  //
+  // The profit is divided by PERCENTAGE: a slice compounded back into VHP, and
+  // a slice for each of three mutually exclusive groups — nodes running a
+  // Koinos AI Node only, nodes producing blocks with the minimum VHP only, and
+  // nodes doing both. Anything not allocated stays in the wallet. See
+  // settleCycle() and tierFor() in distribution.js.
   distribution: {
     enabled: false,
-    // "participation" pays each node in proportion to how much of the window it
-    // was actually present for, so a node appearing at the last minute cannot
-    // collect a full share of a day's (or a rolled-over week's) rewards.
-    // "even" is a flat split among everyone who qualified at settlement.
+    // "participation" pays each node in proportion to the rewards it was
+    // qualifying for as they were earned, so a node appearing at the last
+    // minute cannot collect a full share of a day's (or a rolled-over week's)
+    // rewards. "even" is a flat split within each group.
     weighting: "participation",
-    requireVhpMinimum: true,  // gate 1: producing AND holding >= minVhpKoin
-    requireAiNode: false,     // gate 2: seen running a Koinos AI Node
-    minVhpKoin: "10000",      // a node qualifies with at least this much VHP
+    reburnPct: 0,             // % of profit compounded back into VHP
+    // % of profit paid to each group. null until set — migrated on first read
+    // from the requireVhpMinimum/requireAiNode gates this replaces, so an
+    // upgrade never changes who gets paid (migrateDistributionConfig()).
+    sharePct: null,           // { aiOnly, vhpOnly, both }
+    minVhpKoin: "10000",      // VHP a producer needs to count; "0" = any producer
     aiRosterUrl: "",          // where the live Koinos AI Node roster is read
     payoutHourUtc: 0,         // close the daily cycle at this UTC hour
-    minPayoutKoin: "0.5",     // skip a cycle when the even share would be below this
+    minPayoutKoin: "0.5",     // skip a share below this; it carries instead
     pollMinutes: 10,          // engine check interval (snapshots + queue draining)
   },
   // Prefer the node this app runs for chain reads when it is up and caught up,

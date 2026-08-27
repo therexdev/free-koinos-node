@@ -305,3 +305,15 @@ pre.logs {
 ::-webkit-scrollbar { width: 10px; height: 10px; }
 ::-webkit-scrollbar-thumb { background: var(--card-2); border-radius: 8px; }
 ::-webkit-scrollbar-track { background: transparent; }
+
+/* The distribution split: one row per slice of the profit, with its percentage
+   box on the right. The final row (what stays in the wallet) is derived, not
+   entered, so it reads as a total rather than another input. */
+.split-table td { padding: 6px 0; border-bottom: 1px solid rgba(38, 52, 82, 0.5); vertical-align: middle; }
+.split-table tr:last-child td { border-bottom: none; }
+.split-pct { width: 92px; text-align: right; white-space: nowrap; color: var(--muted); }
+.split-pct input {
+  width: 56px; text-align: right; padding: 5px 6px; margin-right: 4px; display: inline-block;
+}
+.split-table .split-rest td { border-top: 1px solid var(--border); padding-top: 9px; }
+.split-table .split-rest .split-pct { color: var(--text); }

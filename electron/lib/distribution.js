@@ -17,11 +17,15 @@ const { fetchAiRoster, validateRosterUrl } = require("./ai-roster");
 //
 //   1. The vhpConsumed portion is re-burned (KOIN → VHP) so this node's VHP —
 //      and with it, its share of block production — stays level.
-//   2. The profit (plus any carry from earlier cycles) is split EVENLY between
-//      every producer seen this cycle whose VHP balance is at least the
-//      configured threshold (default 10,000 VHP). Even means even: a node with
-//      1M VHP gets the same share as one with 10k. This node counts as one of
-//      the eligible producers and simply keeps its own share.
+//   2. The profit is then carved up BY PERCENTAGE:
+//        reburnPct        compounded back into VHP, on top of (1)
+//        sharePct.aiOnly  to nodes running a Koinos AI Node and nothing else
+//        sharePct.vhpOnly to nodes producing blocks with the minimum VHP only
+//        sharePct.both    to nodes doing both
+//      The three groups are mutually exclusive, each slice is split between the
+//      members of its group (plus that group's carry from earlier cycles), and
+//      whatever the percentages leave over simply stays in the wallet. This
+//      node counts as a member like any other and keeps its own share.
 //
 // Both the reburn and the payouts go into a queue that is drained across
 // checks, capped by the mana available right now (burning and sending KOIN
@@ -49,36 +53,100 @@ const PRESENCE_WINDOW_MS = 3 * 60 * 60 * 1000;
 // buying stake right before a payout.
 const VHP_RECHECK_MS = 60 * 60 * 1000;
 
-function validateDistributionConfig(cfg) {
-  const minVhpKoin = String(cfg.minVhpKoin ?? "").trim();
-  if (cmpSats(parseAmount(minVhpKoin), "0") <= 0) {
-    throw new Error("Minimum VHP must be greater than zero");
+// The three groups profit can be paid to, most specific first. Mutually
+// exclusive: an address is in exactly one of them (or none) at any moment.
+const TIERS = ["both", "vhpOnly", "aiOnly"];
+const TIER_LABELS = {
+  both: "AI node + producing",
+  vhpOnly: "producing with the VHP minimum",
+  aiOnly: "Koinos AI Node",
+};
+
+function pctOf(v) {
+  const n = Math.round(Number(v));
+  if (!Number.isFinite(n) || n < 0) return 0;
+  return Math.min(100, n);
+}
+
+// Before 0.7 two on/off gates decided who shared a single pool. Express the
+// same rule as percentages so upgrading never changes who gets paid, then drop
+// the old keys — validate() returns the new shape, so the first save cleans
+// them out of settings.json for good.
+function migrateDistributionConfig(raw) {
+  const cfg = { ...(raw || {}) };
+  if (!cfg.sharePct || typeof cfg.sharePct !== "object") {
+    const vhp = cfg.requireVhpMinimum === undefined ? true : !!cfg.requireVhpMinimum;
+    const ai = !!cfg.requireAiNode;
+    cfg.sharePct = vhp && ai
+      ? { aiOnly: 0, vhpOnly: 0, both: 100 }
+      : ai
+        ? { aiOnly: 100, vhpOnly: 0, both: 0 }
+        : { aiOnly: 0, vhpOnly: 100, both: 0 };
+    // "Neither gate on" meant every producer, whatever its VHP. The producing
+    // group expresses that as a zero minimum.
+    if (!vhp && !ai) cfg.minVhpKoin = "0";
+    cfg.reburnPct = pctOf(cfg.reburnPct ?? 0);
   }
-  // A blank roster URL is allowed even with the AI gate on — the engine then
-  // fails closed at settlement (pays nobody, carries the pool) and says so,
-  // rather than refusing to save an intent the user can't yet fill in. A
-  // non-blank URL must be well-formed.
-  const aiRosterUrl = String(cfg.aiRosterUrl ?? "").trim();
+  delete cfg.requireVhpMinimum;
+  delete cfg.requireAiNode;
+  return cfg;
+}
+
+// Which requirements actually have to be measured, given what is funded. A
+// group nobody is paid for is not measured at all — that is what lets "pay
+// every producer" and "pay every AI node" stay expressible: with no AI slice
+// funded, an AI operator that produces blocks is simply a producer.
+function activeDimensions(sharePct = {}) {
+  return {
+    produceActive: pctOf(sharePct.vhpOnly) > 0 || pctOf(sharePct.both) > 0,
+    aiActive: pctOf(sharePct.aiOnly) > 0 || pctOf(sharePct.both) > 0,
+  };
+}
+
+function validateDistributionConfig(cfg) {
+  const c = migrateDistributionConfig(cfg);
+  const minVhpKoin = String(c.minVhpKoin ?? "").trim();
+  // "0" is allowed and means "any producer counts, whatever its stake".
+  if (cmpSats(parseAmount(minVhpKoin), "0") < 0) {
+    throw new Error("Minimum VHP can't be negative");
+  }
+  // A blank roster URL is allowed even with an AI slice funded — the engine
+  // then fails closed at settlement (pays nobody from the AI groups, carries
+  // their slice) and says so, rather than refusing to save an intent the user
+  // can't yet fill in. A non-blank URL must be well-formed.
+  const aiRosterUrl = String(c.aiRosterUrl ?? "").trim();
   if (aiRosterUrl) validateRosterUrl(aiRosterUrl);
-  const hour = Number(cfg.payoutHourUtc);
+  const hour = Number(c.payoutHourUtc);
   if (!Number.isInteger(hour) || hour < 0 || hour > 23) {
     throw new Error("Distribution hour must be a whole number between 0 and 23 (UTC)");
   }
-  const minPayoutKoin = String(cfg.minPayoutKoin ?? "").trim();
+  const minPayoutKoin = String(c.minPayoutKoin ?? "").trim();
   parseAmount(minPayoutKoin); // throws when invalid; "0" is allowed
-  const poll = Number(cfg.pollMinutes);
+  const poll = Number(c.pollMinutes);
   if (!Number.isFinite(poll) || poll < 1 || poll > 24 * 60) {
     throw new Error("Check interval must be between 1 minute and 24 hours");
   }
-  const weighting = cfg.weighting === undefined ? "participation" : String(cfg.weighting);
+  const weighting = c.weighting === undefined ? "participation" : String(c.weighting);
   if (!["participation", "even"].includes(weighting)) {
     throw new Error("Share weighting must be participation or even");
   }
+  const reburnPct = pctOf(c.reburnPct);
+  const sharePct = {
+    aiOnly: pctOf(c.sharePct?.aiOnly),
+    vhpOnly: pctOf(c.sharePct?.vhpOnly),
+    both: pctOf(c.sharePct?.both),
+  };
+  const allocated = reburnPct + sharePct.aiOnly + sharePct.vhpOnly + sharePct.both;
+  if (allocated > 100) {
+    throw new Error(
+      `Reburn plus the three share percentages come to ${allocated}% — they can't add up to more than 100% of the profit`
+    );
+  }
   return {
-    enabled: !!cfg.enabled,
+    enabled: !!c.enabled,
     weighting,
-    requireVhpMinimum: !!cfg.requireVhpMinimum,
-    requireAiNode: !!cfg.requireAiNode,
+    reburnPct,
+    sharePct,
     minVhpKoin,
     aiRosterUrl,
     payoutHourUtc: hour,
@@ -125,152 +193,84 @@ function mergeAiSeen(aiSeen, addresses, nowMs) {
   return aiSeen;
 }
 
-// Decide who shares in a cycle's pool. Two independent gates, both optional:
+// Which group an address belongs to at a given moment, or null for none.
+// The groups are mutually exclusive — this is the whole eligibility model in
+// one pure function:
 //
-//   requireVhpMinimum — the node must be producing blocks AND hold at least
-//                       minVhpSat of VHP ("an active node with the stake")
-//   requireAiNode     — the node must have been seen running a Koinos AI Node
-//                       during the cycle
+//   both     producing blocks with the minimum VHP  AND  on the AI roster
+//   vhpOnly  producing blocks with the minimum VHP, not on the roster
+//   aiOnly   on the AI roster, not producing with the minimum VHP
 //
-// The four combinations, all of which this one function expresses:
+// A requirement nobody is paid for is not applied. With no AI slice funded the
+// roster is never consulted, so every qualifying producer is simply `vhpOnly`;
+// with no producing slice funded every roster address is `aiOnly`. That is what
+// keeps "pay every producer" and "pay every AI node" expressible, and it means
+// turning a group's percentage to zero can never quietly disqualify someone
+// from a group that IS funded.
 //
-//   neither  → every node seen producing blocks qualifies
-//   VHP only → nodes producing blocks with enough VHP
-//   AI only  → nodes seen on the AI network, whether or not they produce
-//   both     → must be on an AI node *and* producing with enough VHP
-//
-// Block production is required unless the AI gate is carrying the selection on
-// its own — that is what makes "AI only" mean "anyone seen running an AI node".
-// A candidate whose VHP couldn't be read is never assumed to qualify.
-// Pure; `candidates` are { address, producing, aiNode, vhpSat }.
-function selectEligible({ candidates, requireVhpMinimum, requireAiNode, minVhpSat }) {
-  const needsProducing = requireVhpMinimum || !requireAiNode;
-  const eligible = [];
+// A VHP balance that couldn't be read never counts as meeting the minimum.
+// `candidate` is { producing, aiNode, vhpSat }.
+function tierFor(candidate, { minVhpSat = "0", produceActive = true, aiActive = false } = {}) {
+  const needsStake = cmpSats(minVhpSat, "0") > 0;
+  const meetsStake = !needsStake || (candidate.vhpSat != null && cmpSats(candidate.vhpSat, minVhpSat) >= 0);
+  const produces = produceActive && !!candidate.producing && meetsStake;
+  const ai = aiActive && !!candidate.aiNode;
+  if (produceActive && aiActive) return produces && ai ? "both" : produces ? "vhpOnly" : ai ? "aiOnly" : null;
+  if (produceActive) return produces ? "vhpOnly" : null;
+  if (aiActive) return ai ? "aiOnly" : null;
+  return null;
+}
+
+// Sort candidates into their groups. Returns { tiers: {tier: [address]},
+// rejected } — rejection reasons are tallied for the UI.
+function classifyCandidates(candidates, opts = {}) {
+  const tiers = { both: [], vhpOnly: [], aiOnly: [] };
   const rejected = { notProducing: 0, belowVhp: 0, vhpUnknown: 0, notAiNode: 0 };
-
+  const needsStake = cmpSats(opts.minVhpSat ?? "0", "0") > 0;
   for (const c of candidates || []) {
-    if (needsProducing && !c.producing) {
-      rejected.notProducing += 1;
+    const tier = tierFor(c, opts);
+    if (tier) {
+      tiers[tier].push(c.address);
       continue;
     }
-    if (requireVhpMinimum) {
-      if (c.vhpSat == null) {
-        rejected.vhpUnknown += 1; // balance lookup failed — not judged, not paid
-        continue;
-      }
-      if (cmpSats(c.vhpSat, minVhpSat) < 0) {
-        rejected.belowVhp += 1;
-        continue;
-      }
-    }
-    if (requireAiNode && !c.aiNode) {
-      rejected.notAiNode += 1;
-      continue;
-    }
-    eligible.push(c.address);
+    if (opts.produceActive && !c.producing) rejected.notProducing += 1;
+    else if (opts.produceActive && needsStake && c.vhpSat == null) rejected.vhpUnknown += 1;
+    else if (opts.produceActive && needsStake) rejected.belowVhp += 1;
+    else rejected.notAiNode += 1;
   }
-  return { eligible, rejected };
+  return { tiers, rejected };
 }
 
-// How much of the cycle a node was actually around for, in ticks (one tick per
-// check interval). This is what stops a node that appears in the last ten
-// minutes from collecting a full share of a day's — or a rolled-over week's —
-// rewards.
-//
-// Producers are measured by the SPAN between their first and last block in the
-// window, not by how many blocks they signed. Block count is proportional to
-// stake, so paying by it would quietly undo "everyone gets an equal share
-// regardless of VHP". A span says "they were here from tick 4 to tick 141",
-// which a 10k-VHP node and a 1M-VHP node can report identically.
-//
-// AI nodes are measured by actual roster appearances, because the roster is a
-// true liveness list — no inference needed.
-//
-// With both gates on, a node is credited for the smaller of the two: it only
-// earns while it genuinely satisfied both requirements.
-function participationWeight({ producerSpanTicks = 0, aiTicks = 0, totalTicks = 0, requireVhpMinimum, requireAiNode }) {
-  const span = Math.max(0, Number(producerSpanTicks) || 0);
-  const ai = Math.max(0, Number(aiTicks) || 0);
-  let w;
-  if (requireAiNode && requireVhpMinimum) w = Math.min(span, ai);
-  else if (requireAiNode) w = ai;
-  else w = span;
-  const cap = Math.max(0, Number(totalTicks) || 0);
-  if (cap > 0) w = Math.min(w, cap);
-  return w;
-}
-
-// Close one cycle: how much to reburn, and how the profit pool splits.
-// Pure — everything in satoshi strings.
-//
-//   periodRewardsSat / periodVhpConsumedSat — this node's production this cycle
-//   carrySat      — undistributed remainder from earlier cycles
-//   eligible      — producer addresses seen this cycle with VHP >= threshold
-//                   (may include selfAddress; self keeps its share, no transfer)
-//   minPayoutSat  — when the even share is below this, nothing is paid and the
-//                   whole pool carries into the next cycle
-function settleCycle({
-  periodRewardsSat,
-  periodVhpConsumedSat,
-  carrySat,
-  eligible,
-  selfAddress,
-  minPayoutSat,
-  weighting = "participation",
-}) {
-  const rewards = cmpSats(periodRewardsSat, "0") > 0 ? periodRewardsSat : "0";
-  const vhpConsumed = cmpSats(periodVhpConsumedSat, "0") > 0 ? periodVhpConsumedSat : "0";
-  // Reburn exactly what production consumed, so VHP ends the cycle level.
-  const reburnSat = vhpConsumed;
-  const profitSat = cmpSats(rewards, vhpConsumed) > 0 ? subSats(rewards, vhpConsumed) : "0";
-  const poolSat = addSats(profitSat, carrySat ?? "0");
-
-  // Accept plain addresses (every share equal) or {address, weight} entries.
-  // "even" collapses the weights, which is the old flat split.
-  const entries = (eligible ?? []).map((e) => {
-    const address = typeof e === "string" ? e : e.address;
-    let raw;
+// Split one group's pool between the addresses holding credit in it.
+// Pure; BigInt in, satoshi strings out.
+function splitPool(poolSat, ledger, { weighting, minPayoutSat, selfAddress }) {
+  const entries = Object.entries(ledger || {}).map(([address, credit]) => {
+    let weight;
     try {
-      raw = typeof e === "string" ? 1n : BigInt(e.weight ?? 0);
+      weight = weighting === "even" ? 1n : BigInt(credit ?? 0);
     } catch {
-      raw = 0n;
+      weight = 0n;
     }
-    if (raw < 0n) raw = 0n;
-    return { address, weight: weighting === "even" ? 1n : raw };
-  });
-
-  const n = entries.length;
-  const base = {
-    reburnSat,
-    profitSat,
-    poolSat,
-    eligibleCount: n,
-    shareSat: "0",
-    perWeightSat: "0",
-    recipients: [],
-    paidAddresses: [],
-    selfKeptSat: "0",
-    carryOutSat: poolSat,
-    weighting,
-    totalWeight: "0",
-    skippedBelowMin: 0,
-  };
-  if (n === 0 || cmpSats(poolSat, "0") <= 0) return base;
-
-  const W = entries.reduce((sum, e) => sum + e.weight, 0n);
-  if (W <= 0n) return base; // nobody earned any credit in this window
+    return { address, weight: weight > 0n ? weight : 0n };
+  }).filter((e) => e.weight > 0n);
 
   const pool = BigInt(poolSat);
-  const totalWeight = W.toString();
+  const W = entries.reduce((sum, e) => sum + e.weight, 0n);
+  const empty = {
+    recipients: [], paidAddresses: [], selfKeptSat: "0", distributedSat: "0",
+    shareSat: "0", perWeightSat: "0", totalWeight: W.toString(),
+    count: entries.length, skippedBelowMin: 0,
+  };
+  if (pool <= 0n || W <= 0n) return empty;
+
   const recipients = [];
-  const paidAddresses = []; // exactly who got their credit settled this cycle
-  let selfKeptSat = "0";
+  const paidAddresses = [];
+  let selfKept = 0n;
   let distributed = 0n;
   let skippedBelowMin = 0;
   let topShare = 0n;
-
   for (const e of entries) {
-    const amount = (pool * e.weight) / W; // floor; remainder carries
+    const amount = (pool * e.weight) / W; // floor; the remainder carries
     // A share below the minimum is not worth a transaction — each payout spends
     // mana 1:1. It carries into the next cycle instead of being dusted away,
     // and so does the credit that earned it (see the reset in _closeCycle).
@@ -281,22 +281,136 @@ function settleCycle({
     distributed += amount;
     paidAddresses.push(e.address);
     if (amount > topShare) topShare = amount;
-    if (e.address === selfAddress) selfKeptSat = amount.toString();
+    if (e.address === selfAddress) selfKept += amount;
     else recipients.push({ address: e.address, amountSat: amount.toString() });
   }
-
   return {
-    ...base,
-    // What one tick of presence was worth, and the largest share paid (they are
-    // the same figure when every node was present the whole window).
-    perWeightSat: (pool / W).toString(),
-    shareSat: topShare.toString(),
+    ...empty,
     recipients,
     paidAddresses,
-    selfKeptSat,
-    carryOutSat: (pool - distributed).toString(),
-    totalWeight,
+    selfKeptSat: selfKept.toString(),
+    distributedSat: distributed.toString(),
+    shareSat: topShare.toString(),
+    perWeightSat: (pool / W).toString(),
     skippedBelowMin,
+  };
+}
+
+// Close one cycle: what to reburn, what each group is paid, what carries and
+// what the wallet simply keeps. Pure — everything in satoshi strings.
+//
+//   periodRewardsSat / periodVhpConsumedSat — this node's production this cycle
+//   carry     — { tier: satoshis } undistributed from earlier cycles
+//   credits   — { tier: { address: satoshis } } earned this cycle and before
+//   reburnPct — % of this cycle's profit to compound back into VHP. Applying it
+//               once at settlement is identical to taking it from every reward
+//               as it lands, since it is a flat fraction either way.
+//   sharePct  — { aiOnly, vhpOnly, both } % of this cycle's profit per group
+//   heldTiers — groups whose requirement couldn't be verified this cycle: they
+//               are still allocated, but the money carries rather than paying
+//               anyone, so an outage never turns other people's share into
+//               profit for this node.
+//
+// A group nobody was in earns nothing: its slice is not allocated at all and
+// stays in the wallet along with whatever the percentages left unallocated.
+function settleCycle({
+  periodRewardsSat,
+  periodVhpConsumedSat,
+  carry,
+  credits,
+  selfAddress,
+  minPayoutSat,
+  weighting = "participation",
+  reburnPct = 0,
+  sharePct = {},
+  heldTiers = [],
+}) {
+  const rewards = cmpSats(periodRewardsSat, "0") > 0 ? periodRewardsSat : "0";
+  const vhpConsumed = cmpSats(periodVhpConsumedSat, "0") > 0 ? periodVhpConsumedSat : "0";
+  // Reburn exactly what production consumed, so VHP ends the cycle level.
+  const levelReburn = BigInt(vhpConsumed);
+  const profitSat = cmpSats(rewards, vhpConsumed) > 0 ? subSats(rewards, vhpConsumed) : "0";
+  const profit = BigInt(profitSat);
+  const held = new Set(heldTiers);
+
+  const extraReburn = (profit * BigInt(pctOf(reburnPct))) / 100n;
+  let kept = profit - extraReburn; // shrinks as each group's slice is allocated
+  const tiers = {};
+  const byAddress = new Map(); // one transfer per address, even across groups
+  const paidAddresses = {};
+  let selfKept = 0n;
+  let poolTotal = 0n;
+  let topShare = 0n;
+  let eligibleCount = 0;
+  let skippedBelowMin = 0;
+  const carryOut = {};
+
+  for (const tier of TIERS) {
+    const ledger = credits?.[tier] ?? {};
+    const carryIn = BigInt(carry?.[tier] ?? "0");
+    const hasCredit = Object.values(ledger).some((c) => {
+      try { return BigInt(c ?? 0) > 0n; } catch { return false; }
+    });
+    const isHeld = held.has(tier);
+    const alloc = hasCredit || isHeld ? (profit * BigInt(pctOf(sharePct[tier]))) / 100n : 0n;
+    kept -= alloc;
+    const pool = alloc + carryIn;
+    poolTotal += pool;
+
+    const split = isHeld
+      ? splitPool("0", {}, { weighting, minPayoutSat, selfAddress })
+      : splitPool(pool.toString(), ledger, { weighting, minPayoutSat, selfAddress });
+
+    for (const r of split.recipients) {
+      byAddress.set(r.address, (byAddress.get(r.address) ?? 0n) + BigInt(r.amountSat));
+    }
+    paidAddresses[tier] = split.paidAddresses;
+    selfKept += BigInt(split.selfKeptSat);
+    if (BigInt(split.shareSat) > topShare) topShare = BigInt(split.shareSat);
+    eligibleCount += split.count;
+    skippedBelowMin += split.skippedBelowMin;
+    const out = pool - BigInt(split.distributedSat);
+    carryOut[tier] = out.toString();
+    tiers[tier] = {
+      pct: pctOf(sharePct[tier]),
+      allocSat: alloc.toString(),
+      carryInSat: carryIn.toString(),
+      poolSat: pool.toString(),
+      count: split.count,
+      recipientCount: split.recipients.length,
+      paidSat: split.distributedSat,
+      selfKeptSat: split.selfKeptSat,
+      shareSat: split.shareSat,
+      perWeightSat: split.perWeightSat,
+      totalWeight: split.totalWeight,
+      skippedBelowMin: split.skippedBelowMin,
+      carryOutSat: out.toString(),
+      held: isHeld,
+    };
+  }
+
+  const recipients = [...byAddress.entries()].map(([address, amount]) => ({
+    address,
+    amountSat: amount.toString(),
+  }));
+
+  return {
+    levelReburnSat: levelReburn.toString(),
+    extraReburnSat: extraReburn.toString(),
+    reburnSat: (levelReburn + extraReburn).toString(),
+    profitSat,
+    poolSat: poolTotal.toString(),
+    keptSat: (kept > 0n ? kept : 0n).toString(),
+    tiers,
+    recipients,
+    paidAddresses,
+    selfKeptSat: selfKept.toString(),
+    shareSat: topShare.toString(),
+    carryOut,
+    carryOutSat: Object.values(carryOut).reduce((a, v) => addSats(a, v), "0"),
+    eligibleCount,
+    skippedBelowMin,
+    weighting,
   };
 }
 
@@ -344,6 +458,56 @@ function planTick({ reburnOwedSat, payouts, availableLiquidSat, availableManaSat
   return { actions, limitedBy };
 }
 
+// Which group a single-pool config maps onto — where pre-0.7 state, which knew
+// only one pool and one credit ledger, belongs now.
+function primaryTier(cfg) {
+  const pct = cfg?.sharePct ?? {};
+  let best = "vhpOnly";
+  for (const tier of TIERS) if (pctOf(pct[tier]) > pctOf(pct[best])) best = tier;
+  return best;
+}
+
+// Move pre-0.7 state onto the per-group shape. The old flat carry and credit
+// ledger belong to whichever group the migrated config maps the old rules onto,
+// so an upgrade never orphans money or the credit that earned it.
+function migrateState(st, cfg) {
+  const zero = () => ({ both: "0", vhpOnly: "0", aiOnly: "0" });
+  const home = primaryTier(cfg);
+  if (typeof st.carry === "string") {
+    st.carry = { ...zero(), [home]: st.carry };
+  } else {
+    st.carry = { ...zero(), ...(st.carry ?? {}) };
+  }
+  const c = st.credits;
+  const tiered = c && TIERS.every((t) => c[t] && typeof c[t] === "object");
+  if (!tiered) {
+    const flat = c && typeof c === "object" ? c : {};
+    st.credits = { both: {}, vhpOnly: {}, aiOnly: {} };
+    st.credits[home] = { ...flat };
+  }
+  return st;
+}
+
+// What a given profit would be carved into right now. Mirrors settleCycle's
+// arithmetic so the Status panel and the cycle it eventually closes agree.
+function previewSplit(profitSat, cfg) {
+  const profit = BigInt(cmpSats(profitSat, "0") > 0 ? profitSat : "0");
+  const slice = (pct) => ((profit * BigInt(pctOf(pct))) / 100n).toString();
+  const out = {
+    reburnPct: pctOf(cfg.reburnPct),
+    reburn: slice(cfg.reburnPct),
+    tiers: {},
+    keptPct: 100 - pctOf(cfg.reburnPct),
+  };
+  for (const tier of TIERS) {
+    const pct = pctOf(cfg.sharePct?.[tier]);
+    out.tiers[tier] = { pct, amount: slice(pct) };
+    out.keptPct -= pct;
+  }
+  out.kept = ((profit * BigInt(Math.max(0, out.keptPct))) / 100n).toString();
+  return out;
+}
+
 // Watches the network, closes a distribution cycle once a day, and drains the
 // resulting reburn + payout queue. Mirrors RewardEngine's shape so main.js and
 // the UI treat both engines the same way.
@@ -362,7 +526,7 @@ class DistributionEngine {
   }
 
   config() {
-    return this.settings.get("distribution");
+    return migrateDistributionConfig(this.settings.get("distribution"));
   }
 
   configure(patch) {
@@ -401,7 +565,7 @@ class DistributionEngine {
     return fetchAiRoster(url, { isValidAddress: (a) => this.chain.isValidAddress(a) });
   }
 
-  _readState(key) {
+  _readState(key, cfg = this.config()) {
     const st = this.state.get(key, null) ?? {
       anchor: null,            // { rewards, vhpConsumed } totals at cycle start
       cycleStartedAt: null,
@@ -410,13 +574,14 @@ class DistributionEngine {
       seen: {},                // { [producer]: { blocks, lastSeenHeight, lastSeenMs } }
       aiSeen: {},              // { [address]: { reads, firstSeenMs, lastSeenMs } }
       ticks: 0,                // presence samples taken this cycle
-      // Earned credit per address: every time this node collects a block
-      // reward, each address qualifying AT THAT MOMENT is credited with it.
-      // A share is that credit over the total — so an address is paid for the
-      // rewards it was actually present for, and nothing else. Credits survive
-      // a cycle that pays nobody, so a pool that rolls over still belongs to
+      // Earned credit per address, per group: every time this node collects a
+      // block reward, each address is credited with it in whichever group it
+      // was in AT THAT MOMENT. A share is that credit over its group's total —
+      // so an address is paid for the rewards it was actually present for, in
+      // the capacity it was present in, and nothing else. Credits survive a
+      // cycle that pays nobody, so a pool that rolls over still belongs to
       // whoever was around when it was earned.
-      credits: {},             // { [address]: creditSats }
+      credits: { both: {}, vhpOnly: {}, aiOnly: {} },
       lastRewardTotal: null,   // lifetime rewards at the previous tick
       vhp: {},                 // { [address]: vhpSat } — refreshed hourly
       vhpCheckedAt: 0,
@@ -425,7 +590,7 @@ class DistributionEngine {
       // addresses (a display endpoint that truncates them, say) must be
       // distinguishable from one that genuinely has no workers online.
       aiReads: { ok: 0, failed: 0, accepted: 0, rejected: 0, lastError: null },
-      carry: "0",              // undistributed profit carried between cycles
+      carry: { both: "0", vhpOnly: "0", aiOnly: "0" }, // undistributed, per group
       reburnOwed: "0",         // KOIN still to burn back into VHP
       payouts: [],             // [{ address, amountSat }] waiting to be sent
       history: [],             // closed cycles (newest first)
@@ -434,7 +599,6 @@ class DistributionEngine {
     st.seen ??= {};
     st.aiSeen ??= {};
     st.ticks ??= 0;
-    st.credits ??= {};
     st.vhp ??= {};
     st.vhpCheckedAt ??= 0;
     st.lastRewardTotal ??= null;
@@ -444,6 +608,7 @@ class DistributionEngine {
     st.payouts ??= [];
     st.history ??= [];
     st.actions ??= [];
+    migrateState(st, cfg);
     return st;
   }
 
@@ -556,11 +721,13 @@ class DistributionEngine {
     }
 
     // Snapshot the live Koinos AI Node roster the same way — who is serving on
-    // the AI network right now. Only polled when the AI gate is on; failures
-    // are recorded (settlement fails closed on them) but never stall the tick.
+    // the AI network right now. Only polled when a group that depends on it is
+    // funded; failures are recorded (settlement fails closed on them) but never
+    // stall the tick.
+    const { aiActive, produceActive } = activeDimensions(cfg.sharePct);
     let rosterError = null;
     let aiNowSet = new Set(); // AI addresses live in THIS tick's roster read
-    if (cfg.requireAiNode) {
+    if (aiActive) {
       if (!cfg.aiRosterUrl) {
         rosterError = "No Koinos AI Node roster URL is configured";
         st.aiReads.failed += 1;
@@ -600,17 +767,25 @@ class DistributionEngine {
         : "0";
     st.lastRewardTotal = rewardsNow;
 
-    if (cmpSats(rewardDelta, "0") > 0) {
+    // A roster read that failed means nobody's AI status is known right now.
+    // Crediting anyway would file AI operators under "producing only" and pay
+    // them from the wrong group, so this interval credits nobody. The rewards
+    // still join the pool and reach whoever earned credit at other times.
+    const blindToAi = aiActive && !!rosterError;
+    const minVhpSat = parseAmount(cfg.minVhpKoin);
+
+    if (cmpSats(rewardDelta, "0") > 0 && !blindToAi) {
       const present = Object.entries(st.seen)
         .filter(([, rec]) => now - (rec.lastObservedMs || 0) <= PRESENCE_WINDOW_MS)
         .map(([address]) => address);
-      const candidateNow = [...new Set([...present, ...(cfg.requireAiNode ? aiNowSet : [])])].filter(
-        (a) => this.chain.isValidAddress(a)
+      const candidateNow = [...new Set([...present, ...aiNowSet])].filter((a) =>
+        this.chain.isValidAddress(a)
       );
 
       // Refresh VHP at most hourly — slow-moving data, and one read per
       // candidate per tick would be an RPC storm.
-      if (cfg.requireVhpMinimum && candidateNow.length > 0 && now - st.vhpCheckedAt > VHP_RECHECK_MS) {
+      const needsStake = produceActive && cmpSats(minVhpSat, "0") > 0;
+      if (needsStake && candidateNow.length > 0 && now - st.vhpCheckedAt > VHP_RECHECK_MS) {
         try {
           const fresh = await this.chain.vhpBalances(candidateNow);
           for (const [a, v] of Object.entries(fresh)) if (v != null) st.vhp[a] = v;
@@ -620,21 +795,25 @@ class DistributionEngine {
         }
       }
 
-      // Judge this instant with the very same gate logic settlement uses.
+      // Sort this instant into groups with the very same logic settlement uses.
       const presentSet = new Set(present);
-      const { eligible: qualifyingNow } = selectEligible({
-        candidates: candidateNow.map((address) => ({
+      const { tiers: tieredNow } = classifyCandidates(
+        candidateNow.map((address) => ({
           address,
           producing: presentSet.has(address),
           aiNode: aiNowSet.has(address),
-          vhpSat: cfg.requireVhpMinimum ? st.vhp[address] ?? null : null,
+          vhpSat: needsStake ? st.vhp[address] ?? null : null,
         })),
-        requireVhpMinimum: cfg.requireVhpMinimum,
-        requireAiNode: cfg.requireAiNode,
-        minVhpSat: parseAmount(cfg.minVhpKoin),
-      });
-      for (const a of qualifyingNow) {
-        st.credits[a] = addSats(st.credits[a] ?? "0", rewardDelta);
+        { minVhpSat, produceActive, aiActive }
+      );
+      for (const tier of TIERS) {
+        // No credit in a group nobody is paid from: it could never be settled,
+        // and holding it would pay retroactively for a period the operator
+        // hadn't funded if the percentage were later turned up.
+        if (pctOf(cfg.sharePct[tier]) <= 0) continue;
+        for (const a of tieredNow[tier]) {
+          st.credits[tier][a] = addSats(st.credits[tier][a] ?? "0", rewardDelta);
+        }
       }
     }
 
@@ -671,13 +850,18 @@ class DistributionEngine {
     }
     if (closed) {
       const c = closed;
+      const reburnNote =
+        cmpSats(c.extraReburn ?? "0", "0") > 0
+          ? `reburning ${formatAmount(c.reburn)} KOIN (${formatAmount(c.levelReburn)} to restore VHP, ` +
+            `${formatAmount(c.extraReburn)} compounded)`
+          : `reburning ${formatAmount(c.reburn)} KOIN to restore VHP`;
       const msg = c.holdReason
         ? `Cycle closed but held: ${c.holdReason}`
-        : c.eligibleCount > 0 && cmpSats(c.share, "0") > 0
-          ? `Cycle closed: ${formatAmount(c.pool)} KOIN profit split between ${c.eligibleCount} nodes ` +
-            `(${formatAmount(c.share)} KOIN each) — reburning ${formatAmount(c.reburn)} KOIN to restore VHP.`
+        : c.recipientCount > 0 || cmpSats(c.selfKept, "0") > 0
+          ? `Cycle closed: ${formatAmount(c.pool)} KOIN split between ${c.eligibleCount} nodes ` +
+            `(top share ${formatAmount(c.share)} KOIN) — ${reburnNote}.`
           : `Cycle closed: nothing to distribute yet (${formatAmount(c.pool)} KOIN carries over` +
-            `${cmpSats(c.reburn, "0") > 0 ? `; reburning ${formatAmount(c.reburn)} KOIN to restore VHP` : ""}).`;
+            `${cmpSats(c.reburn, "0") > 0 ? `; ${reburnNote}` : ""}).`;
       this.onEvent({ type: "distribution", message: msg });
       return done(c.holdReason ? "cycle-held" : "cycle-closed", {
         closed, progress, snapshotError, rosterError, message: msg,
@@ -696,7 +880,7 @@ class DistributionEngine {
       if (doneCount > 0) this.onEvent({ type: "distribution", message });
       return done(this._queueEmpty(st) ? "distributed" : "distributing", { progress, snapshotError, message });
     }
-    const aiNote = cfg.requireAiNode
+    const aiNote = aiActive
       ? `, ${Object.keys(st.aiSeen).length} AI nodes seen${rosterError ? ` (roster error: ${rosterError})` : ""}`
       : "";
     return done("watching", {
@@ -708,47 +892,57 @@ class DistributionEngine {
     });
   }
 
-  // Compute the cycle's figures, find who qualifies, and queue the work.
+  // Compute the cycle's figures, work out what each group is owed, and queue
+  // the work.
   async _closeCycle(cfg, st, statsRes, selfAddress, now) {
     const periodRewardsSat = subSats(statsRes.totals.rewards, st.anchor.rewards);
     const periodVhpConsumedSat = subSats(statsRes.totals.vhpConsumed, st.anchor.vhpConsumed);
 
-    // Who earned what. Eligibility was already applied tick by tick as the
+    // Who earned what. Group membership was already applied tick by tick as the
     // credits accrued, so settlement is just "pay out in proportion to credit"
     // — no second, later judgement that a node could game by arriving (or
     // buying VHP) just before the cycle closes.
     const producers = Object.keys(st.seen).filter((a) => this.chain.isValidAddress(a));
+    const { aiActive } = activeDimensions(cfg.sharePct);
 
-    // Fail closed: with the AI gate on, a cycle where the roster never answered
-    // (or only ever returned unusable addresses — the giveaway for a status
-    // page that shortens them for display) cannot know who qualified. Reburn
-    // still happens, since the node's VHP must stay level; nobody is paid and
-    // the credits stand for the next cycle.
-    const rosterNeverAnswered = cfg.requireAiNode && st.aiReads.ok === 0;
+    // Fail closed: with an AI-dependent group funded, a cycle where the roster
+    // never answered (or only ever returned unusable addresses — the giveaway
+    // for a status page that shortens them for display) cannot know who
+    // qualified. Reburn still happens, since the node's VHP must stay level;
+    // those groups pay nobody and their slice carries rather than being kept.
+    const rosterNeverAnswered = aiActive && st.aiReads.ok === 0;
     const rosterAllUnusable =
-      cfg.requireAiNode && st.aiReads.ok > 0 && st.aiReads.accepted === 0 && st.aiReads.rejected > 0;
+      aiActive && st.aiReads.ok > 0 && st.aiReads.accepted === 0 && st.aiReads.rejected > 0;
     const aiUnavailable = rosterNeverAnswered || rosterAllUnusable;
+    const heldTiers = aiUnavailable ? TIERS.filter((t) => t !== "vhpOnly") : [];
 
-    const weighted = aiUnavailable
-      ? []
-      : Object.entries(st.credits)
-          .filter(([address, credit]) => this.chain.isValidAddress(address) && cmpSats(credit, "0") > 0)
-          .map(([address, credit]) => ({ address, weight: credit }));
-    const rejected = { notProducing: 0, belowVhp: 0, vhpUnknown: 0, notAiNode: 0 };
+    // Only pay addresses that still read as valid — a credit ledger outlives
+    // the cycle that filled it, so re-check rather than trusting it blindly.
+    const credits = {};
+    for (const tier of TIERS) {
+      credits[tier] = Object.fromEntries(
+        Object.entries(st.credits[tier] ?? {}).filter(
+          ([address, credit]) => this.chain.isValidAddress(address) && cmpSats(credit, "0") > 0
+        )
+      );
+    }
 
     const settle = settleCycle({
       periodRewardsSat,
       periodVhpConsumedSat,
-      carrySat: st.carry,
-      eligible: weighted,
+      carry: st.carry,
+      credits,
       selfAddress,
       minPayoutSat: parseAmount(cfg.minPayoutKoin),
       weighting: cfg.weighting,
+      reburnPct: cfg.reburnPct,
+      sharePct: cfg.sharePct,
+      heldTiers,
     });
 
     if (cmpSats(settle.reburnSat, "0") > 0) st.reburnOwed = addSats(st.reburnOwed, settle.reburnSat);
     st.payouts.push(...settle.recipients);
-    st.carry = settle.carryOutSat;
+    st.carry = settle.carryOut;
 
     const record = {
       time: now,
@@ -757,31 +951,35 @@ class DistributionEngine {
       profit: settle.profitSat,
       pool: settle.poolSat,
       reburn: settle.reburnSat,
+      levelReburn: settle.levelReburnSat,
+      extraReburn: settle.extraReburnSat,
+      kept: settle.keptSat,
       share: settle.shareSat,
-      perWeight: settle.perWeightSat,
       weighting: settle.weighting,
-      totalWeight: settle.totalWeight,
+      tiers: settle.tiers,
       ticks: st.ticks,
       skippedBelowMin: settle.skippedBelowMin,
       eligibleCount: settle.eligibleCount,
       recipientCount: settle.recipients.length,
       selfKept: settle.selfKeptSat,
       carryOut: settle.carryOutSat,
+      carryOutByTier: settle.carryOut,
       seenCount: producers.length,
       aiSeenCount: Object.keys(st.aiSeen).length,
-      poolCount: weighted.length,
-      rejected,
-      gates: {
-        requireVhpMinimum: cfg.requireVhpMinimum,
-        requireAiNode: cfg.requireAiNode,
+      poolCount: settle.eligibleCount,
+      splits: {
+        reburnPct: cfg.reburnPct,
+        ...cfg.sharePct,
+        keptPct: 100 - cfg.reburnPct - cfg.sharePct.aiOnly - cfg.sharePct.vhpOnly - cfg.sharePct.both,
         minVhpKoin: cfg.minVhpKoin,
       },
-      // Set when the AI roster never answered this cycle — explains a payout of
-      // nobody, so an empty distribution is never a silent mystery.
+      // Set when the AI roster never answered this cycle — explains why the
+      // AI groups paid nobody, so an empty distribution is never a silent
+      // mystery.
       holdReason: rosterAllUnusable
-        ? `The AI node roster answered, but none of the ${st.aiReads.rejected} addresses it returned were valid Koinos addresses — a status/display endpoint that shortens addresses can't be paid to. Nobody was paid and the pool carried over.`
+        ? `The AI node roster answered, but none of the ${st.aiReads.rejected} addresses it returned were valid Koinos addresses — a status/display endpoint that shortens addresses can't be paid to. The AI groups paid nobody and their share carried over.`
         : rosterNeverAnswered
-          ? `Koinos AI Node roster unavailable all cycle (${st.aiReads.lastError ?? "no successful read"}) — nobody was paid and the pool carried over.`
+          ? `Koinos AI Node roster unavailable all cycle (${st.aiReads.lastError ?? "no successful read"}) — the AI groups paid nobody and their share carried over.`
           : null,
     };
     st.history.unshift(record);
@@ -800,7 +998,9 @@ class DistributionEngine {
     // minimum, and the share they earned is absorbed by the larger nodes.
     // Keeping a skipped node's credit lets it build across cycles until it does
     // cross, which is the whole point of carrying the money forward with it.
-    for (const address of settle.paidAddresses ?? []) delete st.credits[address];
+    for (const tier of TIERS) {
+      for (const address of settle.paidAddresses?.[tier] ?? []) delete st.credits[tier][address];
+    }
     st.aiReads = { ok: 0, failed: 0, accepted: 0, rejected: 0, lastError: null };
     st.cycleStartedAt = now;
     st.lastClosedAt = now;
@@ -887,13 +1087,21 @@ class DistributionEngine {
           ticks: st.ticks,
           aiSeenCount: Object.keys(st.aiSeen).length,
           aiReads: st.aiReads,
+          // How the profit so far would be carved up if the cycle closed now.
+          split: previewSplit(cmpSats(r, v) > 0 ? subSats(r, v) : "0", cfg),
         };
       }
       const payoutTotal = st.payouts.reduce((acc, p) => addSats(acc, p.amountSat), "0");
+      // Who currently holds credit in each group — the live answer to "would I
+      // be paid, and out of which pot?".
+      const creditCounts = {};
+      for (const tier of TIERS) creditCounts[tier] = Object.keys(st.credits[tier] ?? {}).length;
       derived = {
         anchored: !!st.anchor,
         cycle,
-        carry: st.carry,
+        carry: Object.values(st.carry).reduce((a, v) => addSats(a, v), "0"),
+        carryByTier: st.carry,
+        creditCounts,
         queue: {
           reburnOwed: st.reburnOwed,
           payouts: st.payouts,
@@ -920,11 +1128,17 @@ class DistributionEngine {
 module.exports = {
   DistributionEngine,
   validateDistributionConfig,
+  migrateDistributionConfig,
+  activeDimensions,
   nextCycleClose,
   mergeSeen,
   mergeAiSeen,
-  selectEligible,
-  participationWeight,
+  tierFor,
+  classifyCandidates,
+  splitPool,
   settleCycle,
+  previewSplit,
   planTick,
+  TIERS,
+  TIER_LABELS,
 };

@@ -3,9 +3,9 @@
 A desktop app that runs a block-producing Koinos node **for the network, not
 just for yourself**. It is [Koinos Node Desktop](https://github.com/therexdev/Koinos-Node)
 with one big difference: instead of keeping the block rewards it earns, it can
-**redistribute the profit evenly to every node producing on the network** that
-holds enough VHP — while automatically reburning the rest so its own VHP (and
-its block production) never shrinks.
+**share the profit out to other nodes on the network** — by percentage, to the
+groups you choose — while automatically reburning the VHP its blocks consumed
+so its own stake (and its block production) never shrinks.
 
 ## How community distribution works
 
@@ -20,40 +20,74 @@ With **Community distribution** enabled (Distribution tab):
 
 1. **Snapshotting.** While your node runs, the app continuously reads the
    latest block headers from the chain and records every block's signer — a
-   live census of which nodes are actually producing right now. Every producer
-   seen during the day is a candidate for that day's distribution.
+   live census of which nodes are actually producing right now — and, when an
+   AI group is funded, the Koinos AI Node roster alongside it.
 2. **Daily settlement.** Once a day (at a UTC hour you choose) the cycle
-   closes:
-   - The **VHP consumed** by your production that day is queued to be
-     **re-burned** (KOIN → VHP), so your node's VHP ends the day level and it
-     keeps producing at the same rate.
-   - The **profit** is split between every node that met the eligibility
-     requirements (below), in proportion to **the rewards each was qualifying
-     for as they were earned** — never in proportion to stake. A node with 1,000,000 VHP
-     earns exactly what a node with 10,000 earns for the same uptime. With
-     everyone present the whole window, 100 KOIN across 10 nodes is 10 KOIN
-     each. Your own node counts as one of them and simply keeps its share.
+   closes. The **VHP consumed** by your production that day is queued to be
+   **re-burned** (KOIN → VHP), so your node's VHP ends the day level and it
+   keeps producing at the same rate. The **profit** is then carved up by
+   percentage (below).
 3. **Paced payouts.** Reburns and payouts go into a queue that drains over the
    following hours, automatically capped to the mana available at each check
    (burning and sending KOIN each spend mana 1:1 on-chain). Nothing is lost if
    the app is briefly closed or the wallet is locked — the queue picks up where
    it left off.
 
-If the even share would be smaller than the minimum payout (a setting), nothing
-is sent that day and the whole pool carries into the next day's pot. Integer
-division remainders carry over too — satoshis are never dropped.
+### Where the profit goes — four percentages
+
+Each cycle's profit is divided by percentages you set:
+
+| Slice | What it does |
+| --- | --- |
+| ♻️ **Reburn** | Compounded back into VHP, on top of the VHP your blocks consumed — this is the slice that grows the node |
+| 🤖 **Koinos AI Node only** | Split between addresses seen on the AI network that are *not* producing with the minimum VHP |
+| ⛏️ **Producing only** | Split between nodes producing blocks with the minimum VHP that are *not* on the AI network |
+| ⭐ **Both** | Split between nodes doing both |
+| 👛 **Whatever is left** | Stays in your wallet |
+
+The three groups are **mutually exclusive** — a node is in exactly one of them
+at any moment — so a node doing both is paid from the *Both* slice and from
+neither of the others. The Distribution tab shows the leftover percentage live
+as you type, and warns if *Both* is left at 0% while the other two are funded,
+since that would pay nodes doing less and nothing to the nodes doing more.
+
+Worked through, with 100 KOIN of profit and 40 / 10 / 20 / 30:
+
+```
+40 KOIN  reburned into VHP        (on top of restoring the VHP consumed)
+10 KOIN  split between the AI-only nodes
+20 KOIN  split between the producing-only nodes
+30 KOIN  split between the nodes doing both
+ 0 KOIN  left in the wallet
+```
+
+The reburn is applied once at settlement, which is identical to taking it from
+every reward as it lands — it is a flat fraction either way. Set every share to
+0% and the app behaves exactly like a normal node that compounds.
+
+**A requirement nobody is paid for is never measured.** With no AI slice funded
+the roster is never read at all, so an AI operator that produces blocks is
+simply a producer; with no producing slice funded, block production and VHP are
+irrelevant. Turning a group to 0% can never quietly disqualify someone from a
+group that *is* funded.
+
+**A group nobody was in earns nothing** — its slice is not allocated at all and
+stays in the wallet, rather than accumulating in a pool that may never have
+anyone to pay. The one exception is a group that was *held* (below).
 
 ### How shares are sized — by the rewards you were there for
 
-Every time your node collects a block reward, **each address qualifying at that
-moment is credited with it**. At settlement the pool is divided in proportion to
-those credits.
+Every time your node collects a block reward, **each address is credited with
+it in whichever group it was in at that moment**. At settlement each group's
+slice is divided in proportion to those credits.
 
 Worked through: your node mines a block while only A qualifies, then another
 while A and B both qualify. Credits are A=2, B=1, so A takes 66% and B takes
 33%. A third reward with A gone and C arrived makes it A=2, B=2, C=1 — 40/40/20.
 Somebody who appears ten minutes before payout is credited for ten minutes of
-rewards, not for the day.
+rewards, not for the day. An address that produces all morning and then joins
+the AI roster holds credit in two groups and is paid from both — in one
+transfer, since every payout spends mana.
 
 Three properties fall out of this, all deliberate:
 
@@ -62,34 +96,19 @@ Three properties fall out of this, all deliberate:
   same rewards earn the same.
 - **Rolled-over pools stay with who earned them.** Credits are cleared only when
   a pool is actually paid out — never when a cycle carries — so a node arriving
-  after a quiet week cannot collect a share of that week.
+  after a quiet week cannot collect a share of that week. Carry is kept per
+  group, so it is always re-split by the group that earned it.
 - **Eligibility is judged as the credit accrues**, not once at the end. Buying
   VHP or joining the roster just before settlement earns nothing retroactively.
   (VHP balances are re-read hourly rather than every check, which bounds the RPC
   cost; that hour is the width of the window.)
 
-Switch **How the pool is split** to *Evenly* for a flat split among everyone
-holding credit, which ignores how much they earned.
+Switch **How each group's share is split** to *Evenly* for a flat split among
+everyone holding credit in that group, which ignores how much they earned.
 
 A share that lands below the minimum payout is skipped and carried rather than
 sent, because every payout spends mana 1:1 — dust transfers cost real resource
 credits for no benefit.
-
-### Who qualifies — two independent requirements
-
-Eligibility is controlled by two checkboxes that can be used alone, together,
-or not at all:
-
-| Require VHP minimum | Running Koinos AI Node | Who earns a share |
-| :---: | :---: | --- |
-| ☐ | ☐ | Every node seen producing a block that day |
-| ☑ | ☐ | Nodes producing blocks that hold at least the minimum VHP (default 10,000) |
-| ☐ | ☑ | Every address seen running a Koinos AI Node, whether or not it produces blocks |
-| ☑ | ☑ | Both: must be on a Koinos AI Node **and** producing blocks with the minimum VHP |
-
-Block production is required in every combination except *AI only* — that mode
-deliberately credits AI-node operators who aren't block producers at all.
-A node whose VHP balance can't be read is never assumed to qualify.
 
 **Verifying "Running Koinos AI Node."** The app reads a **roster URL** — an
 endpoint listing the addresses currently serving on the Koinos AI network — and
@@ -98,15 +117,17 @@ was seen on the roster at any point during the day. The URL must be `https://`
 (or `http://` on 127.0.0.1 for a scheduler running beside the app), responses are
 size-capped, and every entry is checksum-validated before it can be paid.
 
-> The roster decides who gets paid. Point it only at a roster you trust — whoever
-> controls that endpoint can nominate payees (though never more than the day's
-> profit, and never past the VHP gate when that is also on).
+> The roster decides who gets paid from the AI slices. Point it only at a roster
+> you trust — whoever controls that endpoint can nominate payees (though never
+> more than those slices, and never past the VHP gate for the *Both* group).
 
-**It fails closed.** If the AI requirement is on and the roster could not be read
-even once during a day — no URL set, endpoint down, bad response — that day pays
-**nobody** and carries the entire pool into the next day. The VHP reburn still
-happens, so your node's production is never affected. The cycle is recorded as
-*held* with the reason, so an empty distribution is never a silent mystery.
+**It fails closed.** If a roster read fails, that interval credits nobody at all
+rather than filing AI operators under "producing only" and paying them from the
+wrong slice. If the roster could not be read even once during a day, the AI
+groups pay **nobody** and their slices **carry** into the next day rather than
+being kept — an outage must never quietly turn other people's share into your
+profit. The VHP reburn still happens, so your node's production is never
+affected, and the cycle is recorded as *held* with the reason.
 
 **Turn it off and the app behaves exactly like Koinos Node Desktop**: you keep
 your rewards, and the Reward-returns tab can compound them back into VHP for
@@ -123,14 +144,20 @@ never distributed.
 | Setting | Default | Meaning |
 | --- | --- | --- |
 | Enable community distribution | off | Off = behave like a normal node |
-| How the pool is split | By rewards earned | Share ∝ the rewards each node was qualifying for; or a flat even split |
-| Require VHP minimum | on | Gate 1: must be producing blocks with enough VHP |
-| Running Koinos AI Node | off | Gate 2: must be seen on the Koinos AI network |
-| Minimum VHP to qualify | 10,000 | A producer must hold at least this much VHP to receive a share |
-| Koinos AI Node roster URL | *(unset)* | Where the live AI-node roster is read (required by gate 2) |
+| Reburn | 0% | Share of profit compounded back into VHP |
+| Koinos AI Node only | — | Share of profit for AI nodes that don't produce |
+| Producing only | 100% | Share of profit for producers not on the AI network |
+| Both | — | Share of profit for nodes doing both |
+| How each group's share is split | By rewards earned | Share ∝ the rewards each node was qualifying for; or a flat even split |
+| Minimum VHP to count as producing | 10,000 | 0 means any producer counts, whatever its stake |
+| Koinos AI Node roster URL | *(unset)* | Where the live AI-node roster is read (needed when an AI group is funded) |
 | Distribute daily at | 0 (UTC) | Hour of day the cycle closes and payouts are queued |
-| Minimum share to pay out | 0.5 KOIN | Below this the day's pool carries to the next day |
+| Minimum share to pay out | 0.5 KOIN | Below this a share is skipped and carries to the next day |
 | Check every | 10 min | Snapshot + queue-draining interval |
+
+Upgrading from an earlier version carries the old *Require VHP minimum* /
+*Running Koinos AI Node* checkboxes over as percentages that pay exactly the
+same people, and moves the pending carry and credits with them.
 
 ## Node value in USD
 
@@ -213,8 +240,9 @@ npm test          # unit + integration tests (node --test)
 ```
 electron/main.js            app bootstrap + IPC surface
 electron/lib/
-  distribution.js           community distribution engine (snapshot, daily
-                            settlement, mana-paced reburn + payout queue)
+  distribution.js           community distribution engine (snapshot, group
+                            classification, percentage settlement, mana-paced
+                            reburn + payout queue)
   rewards.js                classic reward-returns engine
   chain.js                  balances, burn, transfer, block-header scanning,
                             VHP eligibility checks
@@ -231,8 +259,8 @@ test/                       node --test suite
   signed locally, so the app must be open with the wallet unlocked for the
   queue to drain.
 - Recipients are only ever addresses observed **signing blocks on-chain** with
-  a verified VHP balance at settlement time — there is no recipient list to
-  configure and nothing external can inject addresses.
+  a verified VHP balance, or returned by the AI roster you configured — there is
+  no recipient list to configure and nothing else can inject addresses.
 - No telemetry. This app moves real funds — back up your WIF and test on
   Harbinger first if unsure.
 

@@ -269,7 +269,9 @@ function registerIpc({ settings, state, wallet, chain, nodeMgr, setup, rewards, 
     platform: FORCED_PLATFORM || process.platform,
     userData,
     networks: publicNetworks,
-    settings: settings.all(),
+    // The distribution block is served migrated, so the first paint of that
+    // tab shows the rule actually in force rather than the raw stored shape.
+    settings: { ...settings.all(), distribution: distribution.config() },
     minPasswordLength: MIN_PASSWORD_LENGTH,
     rpc: chain.rpcStatus(),
   }));
