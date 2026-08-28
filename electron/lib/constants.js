@@ -146,22 +146,23 @@ const DEFAULT_SETTINGS = {
   // (keep/compound your own rewards via the Reward-returns tab).
   //
   // The profit is divided by PERCENTAGE: a slice compounded back into VHP, and
-  // a slice for each of three mutually exclusive groups — nodes running a
-  // Koinos AI Node only, nodes producing blocks with the minimum VHP only, and
-  // nodes doing both. Anything not allocated stays in the wallet. See
-  // settleCycle() and tierFor() in distribution.js.
+  // a slice for each of three pools — nodes running a Koinos AI Node, nodes
+  // producing blocks with the minimum VHP, and nodes doing both. Membership
+  // OVERLAPS: qualify for both requirements and you are paid from all three.
+  // Anything not allocated stays in the wallet. See settleCycle() and
+  // tiersFor() in distribution.js.
   distribution: {
     enabled: false,
     // "participation" pays each node in proportion to the rewards it was
     // qualifying for as they were earned, so a node appearing at the last
     // minute cannot collect a full share of a day's (or a rolled-over week's)
-    // rewards. "even" is a flat split within each group.
+    // rewards. "even" is a flat split within each pool.
     weighting: "participation",
     reburnPct: 0,             // % of profit compounded back into VHP
-    // % of profit paid to each group. null until set — migrated on first read
+    // % of profit paid to each pool. null until set — migrated on first read
     // from the requireVhpMinimum/requireAiNode gates this replaces, so an
     // upgrade never changes who gets paid (migrateDistributionConfig()).
-    sharePct: null,           // { aiOnly, vhpOnly, both }
+    sharePct: null,           // { ai, producing, both }
     minVhpKoin: "10000",      // VHP a producer needs to count; "0" = any producer
     aiRosterUrl: "",          // where the live Koinos AI Node roster is read
     payoutHourUtc: 0,         // close the daily cycle at this UTC hour

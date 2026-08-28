@@ -2499,7 +2499,7 @@ function renderDistributionView() {
   const cfg = S.distribution?.config ?? S.appInfo.settings.distribution;
   root.innerHTML = `
     <h1>Community distribution</h1>
-    <p class="lead">Run your node for the network, not just yourself: the VHP each block consumes is automatically re-burned so your node keeps producing at the same level, and the <b>profit</b> is then carved up by percentage — once a day — between compounding, the groups you choose to reward, and your own wallet. Turn it off and the app behaves exactly like a normal node.</p>
+    <p class="lead">Run your node for the network, not just yourself: the VHP each block consumes is automatically re-burned so your node keeps producing at the same level, and the <b>profit</b> is then carved up by percentage — once a day — between compounding, the pools you choose to reward, and your own wallet. Turn it off and the app behaves exactly like a normal node.</p>
     <div class="grid-2">
       <div class="card">
         <h2>⚙️ Configuration</h2>
@@ -2512,11 +2512,11 @@ function renderDistributionView() {
             <tbody>
               <tr><td>♻️ <b>Reburn</b> <span class="muted small">— compounded back into VHP</span></td>
                 <td class="split-pct"><input id="di-pct-reburn" type="number" min="0" max="100" class="mono" value="${pct(cfg.reburnPct)}">%</td></tr>
-              <tr><td>🤖 <b>Koinos AI Node only</b> <span class="muted small">— on the AI network, not producing with the VHP</span></td>
-                <td class="split-pct"><input id="di-pct-ai" type="number" min="0" max="100" class="mono" value="${pct(cfg.sharePct?.aiOnly)}">%</td></tr>
-              <tr><td>⛏️ <b>Producing only</b> <span class="muted small">— blocks with the minimum VHP, not on the AI network</span></td>
-                <td class="split-pct"><input id="di-pct-vhp" type="number" min="0" max="100" class="mono" value="${pct(cfg.sharePct?.vhpOnly)}">%</td></tr>
-              <tr><td>⭐ <b>Both</b> <span class="muted small">— on a Koinos AI Node <i>and</i> producing with the minimum VHP</span></td>
+              <tr><td>🤖 <b>Koinos AI Node</b> <span class="muted small">— every address seen on the AI network</span></td>
+                <td class="split-pct"><input id="di-pct-ai" type="number" min="0" max="100" class="mono" value="${pct(cfg.sharePct?.ai)}">%</td></tr>
+              <tr><td>⛏️ <b>Producing</b> <span class="muted small">— every node producing blocks with the minimum VHP</span></td>
+                <td class="split-pct"><input id="di-pct-vhp" type="number" min="0" max="100" class="mono" value="${pct(cfg.sharePct?.producing)}">%</td></tr>
+              <tr><td>⭐ <b>Both</b> <span class="muted small">— a bonus for doing both, <i>on top of</i> the two above</span></td>
                 <td class="split-pct"><input id="di-pct-both" type="number" min="0" max="100" class="mono" value="${pct(cfg.sharePct?.both)}">%</td></tr>
               <tr class="split-rest"><td>👛 <b>Stays in your wallet</b> <span class="muted small">— whatever the percentages leave over</span></td>
                 <td class="split-pct"><span id="di-pct-kept" class="mono">0</span>%</td></tr>
@@ -2524,10 +2524,10 @@ function renderDistributionView() {
           </table>
           <p class="hint" id="di-rule" style="margin-top:8px"></p>
         </div>
-        <label class="field"><span>How each group's share is split between its members</span>
+        <label class="field"><span>How each pool's share is split between its members</span>
           <select id="di-weighting">
             <option value="participation" ${cfg.weighting !== "even" ? "selected" : ""}>\u23f1\ufe0f By rewards earned — share \u221d the rewards a node was qualifying for</option>
-            <option value="even" ${cfg.weighting === "even" ? "selected" : ""}>\u2696\ufe0f Evenly — a flat split among everyone in the group</option>
+            <option value="even" ${cfg.weighting === "even" ? "selected" : ""}>\u2696\ufe0f Evenly — a flat split among everyone in the pool</option>
           </select></label>
         <label class="field" id="di-minvhp-wrap"><span>Minimum VHP a node needs to count as producing <span class="muted small">(0 = any producer)</span></span>
           <input id="di-minvhp" type="text" class="mono" value="${esc(cfg.minVhpKoin)}"></label>
@@ -2546,10 +2546,10 @@ function renderDistributionView() {
           <button id="di-now" class="btn">Check now</button>
           <button id="di-close" class="btn">Distribute now</button>
         </div>
-        <p class="hint">The three groups are <b>exclusive</b> — a node is in exactly one of them at any moment — and each group's percentage is split between its own members. The reburn is on top of the VHP your blocks consume, which is always restored so your node keeps producing at the same rate.</p>
-        <p class="hint">Every time this node collects a block reward, each address is credited with it in whichever group it was in <b>at that moment</b>, and each group's share is paid in proportion to those credits. Be qualified for two of three rewards while someone else catches one, and you are paid exactly 2:1. Turn up in the last ten minutes and you earn the last ten minutes. Stake never buys a bigger share — a node with ten times the minimum VHP earns the same as one right at it.</p>
-        <p class="hint">Credits are only cleared when a pool is actually paid out, so rewards that roll over still belong to whoever was around when they were earned. Any share below the minimum is skipped and carried rather than sent, because each payout spends mana. A group nobody was in earns nothing — its percentage simply stays in your wallet.</p>
-        <p class="hint">Whenever an AI group is funded, the roster URL decides who is credited — point it only at a roster you trust. If the roster can't be read at any point during a day, the AI groups pay nobody and their share carries over rather than being kept (the VHP reburn still happens).</p>
+        <p class="hint">The pools <b>overlap</b>: run a Koinos AI Node and you are in the AI pool, produce blocks with the minimum VHP and you are in the producing pool — do both and you are in all three, paid from each. Each pool's percentage is split between its own members. The reburn is on top of the VHP your blocks consume, which is always restored so your node keeps producing at the same rate.</p>
+        <p class="hint">Every time this node collects a block reward, each address is credited with it in every pool it belonged to <b>at that moment</b>, and each pool's share is paid in proportion to those credits. Be qualified for two of three rewards while someone else catches one, and you are paid exactly 2:1. Turn up in the last ten minutes and you earn the last ten minutes. Stake never buys a bigger share — a node with ten times the minimum VHP earns the same as one right at it.</p>
+        <p class="hint">Credits are only cleared when a pool is actually paid out, so rewards that roll over still belong to whoever was around when they were earned. Any share below the minimum is skipped and carried rather than sent, because each payout spends mana. A pool nobody was in earns nothing — its percentage simply stays in your wallet.</p>
+        <p class="hint">Whenever an AI pool is funded, the roster URL decides who is credited — point it only at a roster you trust. If the roster can't be read at any point during a day, the AI pools pay nobody and their share carries over rather than being kept. The producing pool is unaffected, and the VHP reburn still happens.</p>
         <p class="hint">Payouts are signed locally, so the app must be open with the wallet unlocked. Sending and reburning KOIN spend <b>mana</b> — big distributions drain out in chunks as mana recharges. Enabling this turns off the Reward-returns tab (they'd both spend the same rewards).</p>
       </div>
       <div class="card">
@@ -2573,31 +2573,32 @@ function renderDistributionView() {
   // surprise waiting until Save.
   const syncSplits = () => {
     const p = splitInputs();
-    const allocated = p.reburnPct + p.aiOnly + p.vhpOnly + p.both;
+    const allocated = p.reburnPct + p.ai + p.producing + p.both;
     const kept = 100 - allocated;
     const keptEl = $("#di-pct-kept");
     keptEl.textContent = String(kept);
     keptEl.className = "mono" + (kept < 0 ? " bad-text" : "");
     // A requirement nobody is paid for is never measured, so its field is only
-    // relevant while a group that depends on it is funded.
-    const produceActive = p.vhpOnly > 0 || p.both > 0;
-    const aiActive = p.aiOnly > 0 || p.both > 0;
+    // relevant while a pool that depends on it is funded.
+    const produceActive = p.producing > 0 || p.both > 0;
+    const aiActive = p.ai > 0 || p.both > 0;
     $("#di-minvhp-wrap").style.display = produceActive ? "block" : "none";
     $("#di-roster-wrap").style.display = aiActive ? "block" : "none";
     $("#di-rule").innerHTML =
       kept < 0
         ? `<span class="bad-text">These come to ${allocated}% — more profit than there is. Reduce them to 100% or less.</span>`
-        : p.both === 0 && p.aiOnly > 0 && p.vhpOnly > 0
-          ? `⚠️ The groups are exclusive, so a node doing <b>both</b> is in neither of the other two — at 0% it earns nothing while nodes doing less are paid. Give “Both” a percentage.`
-          : allocated === 0
-            ? "Nothing is allocated: the profit stays in your wallet, exactly like a normal node."
-            : [
-                p.reburnPct > 0 ? `<b>${p.reburnPct}%</b> compounds into VHP` : null,
-                p.both > 0 ? `<b>${p.both}%</b> to AI nodes that also produce` : null,
-                p.vhpOnly > 0 ? `<b>${p.vhpOnly}%</b> to producers${aiActive ? " not on the AI network" : ""}` : null,
-                p.aiOnly > 0 ? `<b>${p.aiOnly}%</b> to AI nodes${produceActive ? " that don't produce" : ""}` : null,
-                kept > 0 ? `<b>${kept}%</b> stays with you` : null,
-              ].filter(Boolean).join(" · ");
+        : allocated === 0
+          ? "Nothing is allocated: the profit stays in your wallet, exactly like a normal node."
+          : [
+              p.reburnPct > 0 ? `<b>${p.reburnPct}%</b> compounds into VHP` : null,
+              p.ai > 0 ? `<b>${p.ai}%</b> to AI nodes` : null,
+              p.producing > 0 ? `<b>${p.producing}%</b> to producers` : null,
+              p.both > 0 ? `<b>${p.both}%</b> more to nodes doing both` : null,
+              kept > 0 ? `<b>${kept}%</b> stays with you` : null,
+            ].filter(Boolean).join(" · ") +
+            (p.both > 0 && p.ai > 0 && p.producing > 0
+              ? ` — a node doing both is paid from all three (${p.ai + p.producing + p.both}% of the profit between them).`
+              : "");
   };
   ["#di-pct-reburn", "#di-pct-ai", "#di-pct-vhp", "#di-pct-both"].forEach((sel) =>
     $(sel).addEventListener("input", syncSplits)
@@ -2618,8 +2619,8 @@ function splitInputs() {
   };
   return {
     reburnPct: read("#di-pct-reburn"),
-    aiOnly: read("#di-pct-ai"),
-    vhpOnly: read("#di-pct-vhp"),
+    ai: read("#di-pct-ai"),
+    producing: read("#di-pct-vhp"),
     both: read("#di-pct-both"),
   };
 }
@@ -2633,7 +2634,7 @@ async function onSaveDistribution() {
       enabled: $("#di-enabled").checked,
       weighting: $("#di-weighting").value,
       reburnPct: p.reburnPct,
-      sharePct: { aiOnly: p.aiOnly, vhpOnly: p.vhpOnly, both: p.both },
+      sharePct: { ai: p.ai, producing: p.producing, both: p.both },
       aiRosterUrl: $("#di-roster").value.trim(),
       minVhpKoin: $("#di-minvhp").value.trim(),
       payoutHourUtc: Number($("#di-hour").value),
@@ -2703,11 +2704,12 @@ const DISTRIBUTION_OUTCOME_LABELS = {
 
 const TIER_UI = {
   reburn: ["♻️", "Reburn → VHP"],
-  both: ["⭐", "AI node + producing"],
-  vhpOnly: ["⛏️", "Producing only"],
-  aiOnly: ["🤖", "Koinos AI Node only"],
+  both: ["⭐", "Doing both (bonus)"],
+  producing: ["⛏️", "Producing"],
+  ai: ["🤖", "Koinos AI Node"],
   kept: ["👛", "Stays in your wallet"],
 };
+const TIER_ORDER = ["both", "producing", "ai"];
 
 // The configured carve-up as pills, for the Status panel's one-line summary.
 function splitPills(cfg) {
@@ -2716,10 +2718,9 @@ function splitPills(cfg) {
     if (value > 0) parts.push(`<span class="pill accent">${TIER_UI[key][0]} ${value}%</span>`);
   };
   add("reburn", pct(cfg.reburnPct));
-  add("both", pct(cfg.sharePct?.both));
-  add("vhpOnly", pct(cfg.sharePct?.vhpOnly));
-  add("aiOnly", pct(cfg.sharePct?.aiOnly));
-  const kept = 100 - pct(cfg.reburnPct) - pct(cfg.sharePct?.aiOnly) - pct(cfg.sharePct?.vhpOnly) - pct(cfg.sharePct?.both);
+  for (const tier of TIER_ORDER) add(tier, pct(cfg.sharePct?.[tier]));
+  const kept =
+    100 - pct(cfg.reburnPct) - TIER_ORDER.reduce((a, t) => a + pct(cfg.sharePct?.[t]), 0);
   if (kept > 0) parts.push(`<span class="pill">👛 ${kept}%</span>`);
   return parts.join(" ") || `<span class="pill">nothing allocated</span>`;
 }
@@ -2738,9 +2739,7 @@ function splitRows(split, creditCounts) {
   };
   return [
     row("reburn", split.reburn, split.reburnPct, ""),
-    ...["both", "vhpOnly", "aiOnly"].map((t) =>
-      row(t, split.tiers[t].amount, split.tiers[t].pct, members(t))
-    ),
+    ...TIER_ORDER.map((t) => row(t, split.tiers[t].amount, split.tiers[t].pct, members(t))),
     row("kept", split.kept, Math.max(0, split.keptPct), ""),
   ].join("");
 }
@@ -2755,9 +2754,9 @@ function patchDistributionView() {
   const q = d?.queue;
   const last = r.last;
   const [pillClass, pillLabel] = last ? DISTRIBUTION_OUTCOME_LABELS[last.outcome] ?? ["pill", last.outcome] : ["pill", "no checks yet"];
-  // The roster is only read — and only worth reporting on — while a group that
+  // The roster is only read — and only worth reporting on — while a pool that
   // depends on it is funded.
-  const aiActive = pct(r.config.sharePct?.aiOnly) > 0 || pct(r.config.sharePct?.both) > 0;
+  const aiActive = pct(r.config.sharePct?.ai) > 0 || pct(r.config.sharePct?.both) > 0;
   statusEl.innerHTML = `
     <div class="row spread"><span class="muted">Engine</span>
       <span class="pill ${r.config.enabled ? "good" : "warn"}">${r.config.enabled ? "enabled" : "disabled"}</span></div>
@@ -2769,7 +2768,7 @@ function patchDistributionView() {
     <hr style="border-color:var(--border);border-style:solid;opacity:.4">
     <div class="row spread"><span class="muted">Profit split</span>
       <span class="small">${splitPills(r.config)}</span></div>
-    <div class="row spread"><span class="muted">Within a group</span>
+    <div class="row spread"><span class="muted">Within a pool</span>
       <span class="small">${r.config.weighting === "even"
         ? `<span class="pill">evenly</span>`
         : `<span class="pill accent">by rewards earned</span>`}</span></div>
@@ -2809,10 +2808,10 @@ function patchDistributionView() {
   if (hist) {
     const rows = (d?.history ?? []).map((h) => {
       const paid = h.tiers
-        ? ["both", "vhpOnly", "aiOnly"].reduce((a, t) => addSatsUi(a, h.tiers[t]?.paidSat ?? "0"), "0")
+        ? TIER_ORDER.reduce((a, t) => addSatsUi(a, h.tiers[t]?.paidSat ?? "0"), "0")
         : null;
       const perTier = h.tiers
-        ? ["both", "vhpOnly", "aiOnly"]
+        ? TIER_ORDER
             .filter((t) => h.tiers[t] && h.tiers[t].pct > 0)
             .map((t) => `${TIER_UI[t][0]} ${h.tiers[t].pct}% → ${fmtSat(h.tiers[t].paidSat, 4)} to ${h.tiers[t].recipientCount} node${h.tiers[t].recipientCount === 1 ? "" : "s"}${h.tiers[t].held ? " (held)" : ""}`)
             .join(" · ")

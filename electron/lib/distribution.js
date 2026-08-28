@@ -19,13 +19,14 @@ const { fetchAiRoster, validateRosterUrl } = require("./ai-roster");
 //      and with it, its share of block production — stays level.
 //   2. The profit is then carved up BY PERCENTAGE:
 //        reburnPct        compounded back into VHP, on top of (1)
-//        sharePct.aiOnly  to nodes running a Koinos AI Node and nothing else
-//        sharePct.vhpOnly to nodes producing blocks with the minimum VHP only
-//        sharePct.both    to nodes doing both
-//      The three groups are mutually exclusive, each slice is split between the
-//      members of its group (plus that group's carry from earlier cycles), and
-//      whatever the percentages leave over simply stays in the wallet. This
-//      node counts as a member like any other and keeps its own share.
+//        sharePct.ai        to every node running a Koinos AI Node
+//        sharePct.producing to every node producing with the minimum VHP
+//        sharePct.both      to nodes doing both, ON TOP of the two above
+//      Membership overlaps: qualify for both requirements and you are paid from
+//      all three pools. Each slice is split between the members of its pool
+//      (plus that pool's carry from earlier cycles), and whatever the
+//      percentages leave over simply stays in the wallet. This node counts as a
+//      member like any other and keeps its own share.
 //
 // Both the reburn and the payouts go into a queue that is drained across
 // checks, capped by the mana available right now (burning and sending KOIN
@@ -53,13 +54,15 @@ const PRESENCE_WINDOW_MS = 3 * 60 * 60 * 1000;
 // buying stake right before a payout.
 const VHP_RECHECK_MS = 60 * 60 * 1000;
 
-// The three groups profit can be paid to, most specific first. Mutually
-// exclusive: an address is in exactly one of them (or none) at any moment.
-const TIERS = ["both", "vhpOnly", "aiOnly"];
+// The three pools profit can be paid into. Membership OVERLAPS: a node running
+// a Koinos AI Node is in `ai`, a node producing with the minimum VHP is in
+// `producing`, and a node doing both is in all three — the `both` pool is a
+// bonus on top of the two it already earns from, not an alternative to them.
+const TIERS = ["both", "producing", "ai"];
 const TIER_LABELS = {
-  both: "AI node + producing",
-  vhpOnly: "producing with the VHP minimum",
-  aiOnly: "Koinos AI Node",
+  both: "AI node and producing",
+  producing: "producing with the VHP minimum",
+  ai: "Koinos AI Node",
 };
 
 function pctOf(v) {
@@ -68,22 +71,36 @@ function pctOf(v) {
   return Math.min(100, n);
 }
 
-// Before 0.7 two on/off gates decided who shared a single pool. Express the
-// same rule as percentages so upgrading never changes who gets paid, then drop
-// the old keys — validate() returns the new shape, so the first save cleans
-// them out of settings.json for good.
+// Bring an older config forward.
+//
+//   ≤0.6  two on/off gates decided who shared a single pool
+//   0.7   three exclusive groups, keyed aiOnly / vhpOnly / both
+//
+// Both become the current overlapping pools, keyed ai / producing / both, with
+// the same percentages paying at least the same people. The old keys are then
+// dropped — validate() returns the new shape, so the first save cleans them out
+// of settings.json for good.
 function migrateDistributionConfig(raw) {
   const cfg = { ...(raw || {}) };
-  if (!cfg.sharePct || typeof cfg.sharePct !== "object") {
+  const share = cfg.sharePct && typeof cfg.sharePct === "object" ? { ...cfg.sharePct } : null;
+  if (share && (share.aiOnly !== undefined || share.vhpOnly !== undefined)) {
+    // 0.7's "only" groups are simply these pools before membership overlapped:
+    // a node doing both now also earns from them rather than instead of them.
+    share.ai ??= share.aiOnly;
+    share.producing ??= share.vhpOnly;
+  }
+  if (share) {
+    cfg.sharePct = { ai: pctOf(share.ai), producing: pctOf(share.producing), both: pctOf(share.both) };
+  } else {
     const vhp = cfg.requireVhpMinimum === undefined ? true : !!cfg.requireVhpMinimum;
     const ai = !!cfg.requireAiNode;
     cfg.sharePct = vhp && ai
-      ? { aiOnly: 0, vhpOnly: 0, both: 100 }
+      ? { ai: 0, producing: 0, both: 100 }
       : ai
-        ? { aiOnly: 100, vhpOnly: 0, both: 0 }
-        : { aiOnly: 0, vhpOnly: 100, both: 0 };
+        ? { ai: 100, producing: 0, both: 0 }
+        : { ai: 0, producing: 100, both: 0 };
     // "Neither gate on" meant every producer, whatever its VHP. The producing
-    // group expresses that as a zero minimum.
+    // pool expresses that as a zero minimum.
     if (!vhp && !ai) cfg.minVhpKoin = "0";
     cfg.reburnPct = pctOf(cfg.reburnPct ?? 0);
   }
@@ -93,13 +110,13 @@ function migrateDistributionConfig(raw) {
 }
 
 // Which requirements actually have to be measured, given what is funded. A
-// group nobody is paid for is not measured at all — that is what lets "pay
-// every producer" and "pay every AI node" stay expressible: with no AI slice
-// funded, an AI operator that produces blocks is simply a producer.
+// requirement no pool depends on is not measured at all — with no AI pool
+// funded the roster is never fetched, and with no producing pool funded VHP is
+// never read.
 function activeDimensions(sharePct = {}) {
   return {
-    produceActive: pctOf(sharePct.vhpOnly) > 0 || pctOf(sharePct.both) > 0,
-    aiActive: pctOf(sharePct.aiOnly) > 0 || pctOf(sharePct.both) > 0,
+    produceActive: pctOf(sharePct.producing) > 0 || pctOf(sharePct.both) > 0,
+    aiActive: pctOf(sharePct.ai) > 0 || pctOf(sharePct.both) > 0,
   };
 }
 
@@ -111,7 +128,7 @@ function validateDistributionConfig(cfg) {
     throw new Error("Minimum VHP can't be negative");
   }
   // A blank roster URL is allowed even with an AI slice funded — the engine
-  // then fails closed at settlement (pays nobody from the AI groups, carries
+  // then fails closed at settlement (pays nobody from the AI pools, carries
   // their slice) and says so, rather than refusing to save an intent the user
   // can't yet fill in. A non-blank URL must be well-formed.
   const aiRosterUrl = String(c.aiRosterUrl ?? "").trim();
@@ -132,11 +149,11 @@ function validateDistributionConfig(cfg) {
   }
   const reburnPct = pctOf(c.reburnPct);
   const sharePct = {
-    aiOnly: pctOf(c.sharePct?.aiOnly),
-    vhpOnly: pctOf(c.sharePct?.vhpOnly),
+    ai: pctOf(c.sharePct?.ai),
+    producing: pctOf(c.sharePct?.producing),
     both: pctOf(c.sharePct?.both),
   };
-  const allocated = reburnPct + sharePct.aiOnly + sharePct.vhpOnly + sharePct.both;
+  const allocated = reburnPct + sharePct.ai + sharePct.producing + sharePct.both;
   if (allocated > 100) {
     throw new Error(
       `Reburn plus the three share percentages come to ${allocated}% — they can't add up to more than 100% of the profit`
@@ -193,44 +210,46 @@ function mergeAiSeen(aiSeen, addresses, nowMs) {
   return aiSeen;
 }
 
-// Which group an address belongs to at a given moment, or null for none.
-// The groups are mutually exclusive — this is the whole eligibility model in
-// one pure function:
+// Which pools an address belongs to at a given moment — none, one, or all
+// three. This is the whole eligibility model in one pure function:
 //
-//   both     producing blocks with the minimum VHP  AND  on the AI roster
-//   vhpOnly  producing blocks with the minimum VHP, not on the roster
-//   aiOnly   on the AI roster, not producing with the minimum VHP
+//   ai         on the AI roster
+//   producing  producing blocks with the minimum VHP
+//   both       doing both — earned IN ADDITION to the two above
 //
-// A requirement nobody is paid for is not applied. With no AI slice funded the
-// roster is never consulted, so every qualifying producer is simply `vhpOnly`;
-// with no producing slice funded every roster address is `aiOnly`. That is what
-// keeps "pay every producer" and "pay every AI node" expressible, and it means
-// turning a group's percentage to zero can never quietly disqualify someone
-// from a group that IS funded.
+// Membership overlaps deliberately: someone meeting both requirements should
+// not be paid instead of the two pools they qualify for, but as well as them.
+//
+// A requirement nobody is paid for is not measured at all — with no AI pool
+// funded the roster is never consulted, which keeps "pay every producer"
+// expressible without a roster and saves the network call. Because membership
+// overlaps, that can never cost anyone a pool they qualify for.
 //
 // A VHP balance that couldn't be read never counts as meeting the minimum.
 // `candidate` is { producing, aiNode, vhpSat }.
-function tierFor(candidate, { minVhpSat = "0", produceActive = true, aiActive = false } = {}) {
+function tiersFor(candidate, { minVhpSat = "0", produceActive = true, aiActive = false } = {}) {
   const needsStake = cmpSats(minVhpSat, "0") > 0;
   const meetsStake = !needsStake || (candidate.vhpSat != null && cmpSats(candidate.vhpSat, minVhpSat) >= 0);
   const produces = produceActive && !!candidate.producing && meetsStake;
   const ai = aiActive && !!candidate.aiNode;
-  if (produceActive && aiActive) return produces && ai ? "both" : produces ? "vhpOnly" : ai ? "aiOnly" : null;
-  if (produceActive) return produces ? "vhpOnly" : null;
-  if (aiActive) return ai ? "aiOnly" : null;
-  return null;
+  const tiers = [];
+  if (produces && ai) tiers.push("both");
+  if (produces) tiers.push("producing");
+  if (ai) tiers.push("ai");
+  return tiers;
 }
 
-// Sort candidates into their groups. Returns { tiers: {tier: [address]},
-// rejected } — rejection reasons are tallied for the UI.
+// Sort candidates into their pools. Returns { tiers: {tier: [address]},
+// rejected } — an address can appear in more than one, and rejection reasons
+// are tallied for the UI.
 function classifyCandidates(candidates, opts = {}) {
-  const tiers = { both: [], vhpOnly: [], aiOnly: [] };
+  const tiers = { both: [], producing: [], ai: [] };
   const rejected = { notProducing: 0, belowVhp: 0, vhpUnknown: 0, notAiNode: 0 };
   const needsStake = cmpSats(opts.minVhpSat ?? "0", "0") > 0;
   for (const c of candidates || []) {
-    const tier = tierFor(c, opts);
-    if (tier) {
-      tiers[tier].push(c.address);
+    const belongs = tiersFor(c, opts);
+    if (belongs.length > 0) {
+      for (const tier of belongs) tiers[tier].push(c.address);
       continue;
     }
     if (opts.produceActive && !c.producing) rejected.notProducing += 1;
@@ -241,7 +260,7 @@ function classifyCandidates(candidates, opts = {}) {
   return { tiers, rejected };
 }
 
-// Split one group's pool between the addresses holding credit in it.
+// Split one pool between the addresses holding credit in it.
 // Pure; BigInt in, satoshi strings out.
 function splitPool(poolSat, ledger, { weighting, minPayoutSat, selfAddress }) {
   const entries = Object.entries(ledger || {}).map(([address, credit]) => {
@@ -296,7 +315,7 @@ function splitPool(poolSat, ledger, { weighting, minPayoutSat, selfAddress }) {
   };
 }
 
-// Close one cycle: what to reburn, what each group is paid, what carries and
+// Close one cycle: what to reburn, what each pool is paid, what carries and
 // what the wallet simply keeps. Pure — everything in satoshi strings.
 //
 //   periodRewardsSat / periodVhpConsumedSat — this node's production this cycle
@@ -305,13 +324,13 @@ function splitPool(poolSat, ledger, { weighting, minPayoutSat, selfAddress }) {
 //   reburnPct — % of this cycle's profit to compound back into VHP. Applying it
 //               once at settlement is identical to taking it from every reward
 //               as it lands, since it is a flat fraction either way.
-//   sharePct  — { aiOnly, vhpOnly, both } % of this cycle's profit per group
-//   heldTiers — groups whose requirement couldn't be verified this cycle: they
+//   sharePct  — { ai, producing, both } % of this cycle's profit per pool
+//   heldTiers — pools whose requirement couldn't be verified this cycle: they
 //               are still allocated, but the money carries rather than paying
 //               anyone, so an outage never turns other people's share into
 //               profit for this node.
 //
-// A group nobody was in earns nothing: its slice is not allocated at all and
+// A pool nobody was in earns nothing: its slice is not allocated at all and
 // stays in the wallet along with whatever the percentages left unallocated.
 function settleCycle({
   periodRewardsSat,
@@ -334,9 +353,9 @@ function settleCycle({
   const held = new Set(heldTiers);
 
   const extraReburn = (profit * BigInt(pctOf(reburnPct))) / 100n;
-  let kept = profit - extraReburn; // shrinks as each group's slice is allocated
+  let kept = profit - extraReburn; // shrinks as each pool's slice is allocated
   const tiers = {};
-  const byAddress = new Map(); // one transfer per address, even across groups
+  const byAddress = new Map(); // one transfer per address, however many pools
   const paidAddresses = {};
   let selfKept = 0n;
   let poolTotal = 0n;
@@ -458,32 +477,42 @@ function planTick({ reburnOwedSat, payouts, availableLiquidSat, availableManaSat
   return { actions, limitedBy };
 }
 
-// Which group a single-pool config maps onto — where pre-0.7 state, which knew
+// Which pool a single-pool config maps onto — where pre-0.7 state, which knew
 // only one pool and one credit ledger, belongs now.
 function primaryTier(cfg) {
   const pct = cfg?.sharePct ?? {};
-  let best = "vhpOnly";
+  let best = "producing";
   for (const tier of TIERS) if (pctOf(pct[tier]) > pctOf(pct[best])) best = tier;
   return best;
 }
 
-// Move pre-0.7 state onto the per-group shape. The old flat carry and credit
-// ledger belong to whichever group the migrated config maps the old rules onto,
+// Move older state onto the per-pool shape. The old flat carry and credit
+// ledger belong to whichever pool the migrated config maps the old rules onto,
 // so an upgrade never orphans money or the credit that earned it.
 function migrateState(st, cfg) {
-  const zero = () => ({ both: "0", vhpOnly: "0", aiOnly: "0" });
+  const zero = () => ({ both: "0", producing: "0", ai: "0" });
   const home = primaryTier(cfg);
+  // 0.7 keyed the same pools aiOnly/vhpOnly; carry them over by name.
+  const rename = (o) => ({ ...o, ai: o.ai ?? o.aiOnly, producing: o.producing ?? o.vhpOnly });
   if (typeof st.carry === "string") {
     st.carry = { ...zero(), [home]: st.carry };
   } else {
-    st.carry = { ...zero(), ...(st.carry ?? {}) };
+    const c = rename(st.carry ?? {});
+    st.carry = { both: c.both ?? "0", producing: c.producing ?? "0", ai: c.ai ?? "0" };
   }
-  const c = st.credits;
-  const tiered = c && TIERS.every((t) => c[t] && typeof c[t] === "object");
-  if (!tiered) {
-    const flat = c && typeof c === "object" ? c : {};
-    st.credits = { both: {}, vhpOnly: {}, aiOnly: {} };
-    st.credits[home] = { ...flat };
+  // A pre-0.7 ledger is flat — { address: satoshis }, so every value is a
+  // string. A per-pool one holds an object under each pool key.
+  const credits = st.credits && typeof st.credits === "object" ? st.credits : {};
+  const POOL_KEYS = ["both", "producing", "ai", "vhpOnly", "aiOnly"];
+  const tiered = Object.entries(credits).every(
+    ([k, v]) => POOL_KEYS.includes(k) && v && typeof v === "object"
+  );
+  if (tiered) {
+    const r = rename(credits);
+    st.credits = { both: r.both ?? {}, producing: r.producing ?? {}, ai: r.ai ?? {} };
+  } else {
+    st.credits = { both: {}, producing: {}, ai: {} };
+    st.credits[home] = { ...credits };
   }
   return st;
 }
@@ -574,14 +603,14 @@ class DistributionEngine {
       seen: {},                // { [producer]: { blocks, lastSeenHeight, lastSeenMs } }
       aiSeen: {},              // { [address]: { reads, firstSeenMs, lastSeenMs } }
       ticks: 0,                // presence samples taken this cycle
-      // Earned credit per address, per group: every time this node collects a
-      // block reward, each address is credited with it in whichever group it
-      // was in AT THAT MOMENT. A share is that credit over its group's total —
+      // Earned credit per address, per pool: every time this node collects a
+      // block reward, each address is credited with it in every pool it was in
+      // AT THAT MOMENT. A share is that credit over its pool's total —
       // so an address is paid for the rewards it was actually present for, in
       // the capacity it was present in, and nothing else. Credits survive a
       // cycle that pays nobody, so a pool that rolls over still belongs to
       // whoever was around when it was earned.
-      credits: { both: {}, vhpOnly: {}, aiOnly: {} },
+      credits: { both: {}, producing: {}, ai: {} },
       lastRewardTotal: null,   // lifetime rewards at the previous tick
       vhp: {},                 // { [address]: vhpSat } — refreshed hourly
       vhpCheckedAt: 0,
@@ -590,7 +619,7 @@ class DistributionEngine {
       // addresses (a display endpoint that truncates them, say) must be
       // distinguishable from one that genuinely has no workers online.
       aiReads: { ok: 0, failed: 0, accepted: 0, rejected: 0, lastError: null },
-      carry: { both: "0", vhpOnly: "0", aiOnly: "0" }, // undistributed, per group
+      carry: { both: "0", producing: "0", ai: "0" }, // undistributed, per pool
       reburnOwed: "0",         // KOIN still to burn back into VHP
       payouts: [],             // [{ address, amountSat }] waiting to be sent
       history: [],             // closed cycles (newest first)
@@ -721,7 +750,7 @@ class DistributionEngine {
     }
 
     // Snapshot the live Koinos AI Node roster the same way — who is serving on
-    // the AI network right now. Only polled when a group that depends on it is
+    // the AI network right now. Only polled when a pool that depends on it is
     // funded; failures are recorded (settlement fails closed on them) but never
     // stall the tick.
     const { aiActive, produceActive } = activeDimensions(cfg.sharePct);
@@ -767,14 +796,15 @@ class DistributionEngine {
         : "0";
     st.lastRewardTotal = rewardsNow;
 
-    // A roster read that failed means nobody's AI status is known right now.
-    // Crediting anyway would file AI operators under "producing only" and pay
-    // them from the wrong group, so this interval credits nobody. The rewards
-    // still join the pool and reach whoever earned credit at other times.
-    const blindToAi = aiActive && !!rosterError;
+    // A roster read that failed means nobody's AI status is known right now, so
+    // the AI pools accrue nothing this interval — but the producing pool is
+    // unaffected, since production is knowable without the roster. (That the
+    // outage costs producers nothing is a property of overlapping membership:
+    // their pool never depended on who else is on the AI network.)
+    const aiKnown = aiActive && !rosterError;
     const minVhpSat = parseAmount(cfg.minVhpKoin);
 
-    if (cmpSats(rewardDelta, "0") > 0 && !blindToAi) {
+    if (cmpSats(rewardDelta, "0") > 0) {
       const present = Object.entries(st.seen)
         .filter(([, rec]) => now - (rec.lastObservedMs || 0) <= PRESENCE_WINDOW_MS)
         .map(([address]) => address);
@@ -795,7 +825,7 @@ class DistributionEngine {
         }
       }
 
-      // Sort this instant into groups with the very same logic settlement uses.
+      // Sort this instant into pools with the very same logic settlement uses.
       const presentSet = new Set(present);
       const { tiers: tieredNow } = classifyCandidates(
         candidateNow.map((address) => ({
@@ -804,10 +834,10 @@ class DistributionEngine {
           aiNode: aiNowSet.has(address),
           vhpSat: needsStake ? st.vhp[address] ?? null : null,
         })),
-        { minVhpSat, produceActive, aiActive }
+        { minVhpSat, produceActive, aiActive: aiKnown }
       );
       for (const tier of TIERS) {
-        // No credit in a group nobody is paid from: it could never be settled,
+        // No credit in a pool nobody is paid from: it could never be settled,
         // and holding it would pay retroactively for a period the operator
         // hadn't funded if the percentage were later turned up.
         if (pctOf(cfg.sharePct[tier]) <= 0) continue;
@@ -892,29 +922,30 @@ class DistributionEngine {
     });
   }
 
-  // Compute the cycle's figures, work out what each group is owed, and queue
+  // Compute the cycle's figures, work out what each pool is owed, and queue
   // the work.
   async _closeCycle(cfg, st, statsRes, selfAddress, now) {
     const periodRewardsSat = subSats(statsRes.totals.rewards, st.anchor.rewards);
     const periodVhpConsumedSat = subSats(statsRes.totals.vhpConsumed, st.anchor.vhpConsumed);
 
-    // Who earned what. Group membership was already applied tick by tick as the
+    // Who earned what. Pool membership was already applied tick by tick as the
     // credits accrued, so settlement is just "pay out in proportion to credit"
     // — no second, later judgement that a node could game by arriving (or
     // buying VHP) just before the cycle closes.
     const producers = Object.keys(st.seen).filter((a) => this.chain.isValidAddress(a));
     const { aiActive } = activeDimensions(cfg.sharePct);
 
-    // Fail closed: with an AI-dependent group funded, a cycle where the roster
+    // Fail closed: with an AI-dependent pool funded, a cycle where the roster
     // never answered (or only ever returned unusable addresses — the giveaway
     // for a status page that shortens them for display) cannot know who
     // qualified. Reburn still happens, since the node's VHP must stay level;
-    // those groups pay nobody and their slice carries rather than being kept.
+    // those pools pay nobody and their slice carries rather than being kept.
+    // The producing pool is untouched — it never needed the roster.
     const rosterNeverAnswered = aiActive && st.aiReads.ok === 0;
     const rosterAllUnusable =
       aiActive && st.aiReads.ok > 0 && st.aiReads.accepted === 0 && st.aiReads.rejected > 0;
     const aiUnavailable = rosterNeverAnswered || rosterAllUnusable;
-    const heldTiers = aiUnavailable ? TIERS.filter((t) => t !== "vhpOnly") : [];
+    const heldTiers = aiUnavailable ? ["ai", "both"] : [];
 
     // Only pay addresses that still read as valid — a credit ledger outlives
     // the cycle that filled it, so re-check rather than trusting it blindly.
@@ -970,16 +1001,16 @@ class DistributionEngine {
       splits: {
         reburnPct: cfg.reburnPct,
         ...cfg.sharePct,
-        keptPct: 100 - cfg.reburnPct - cfg.sharePct.aiOnly - cfg.sharePct.vhpOnly - cfg.sharePct.both,
+        keptPct: 100 - cfg.reburnPct - cfg.sharePct.ai - cfg.sharePct.producing - cfg.sharePct.both,
         minVhpKoin: cfg.minVhpKoin,
       },
       // Set when the AI roster never answered this cycle — explains why the
-      // AI groups paid nobody, so an empty distribution is never a silent
+      // AI pools paid nobody, so an empty distribution is never a silent
       // mystery.
       holdReason: rosterAllUnusable
-        ? `The AI node roster answered, but none of the ${st.aiReads.rejected} addresses it returned were valid Koinos addresses — a status/display endpoint that shortens addresses can't be paid to. The AI groups paid nobody and their share carried over.`
+        ? `The AI node roster answered, but none of the ${st.aiReads.rejected} addresses it returned were valid Koinos addresses — a status/display endpoint that shortens addresses can't be paid to. The AI pools paid nobody and their share carried over.`
         : rosterNeverAnswered
-          ? `Koinos AI Node roster unavailable all cycle (${st.aiReads.lastError ?? "no successful read"}) — the AI groups paid nobody and their share carried over.`
+          ? `Koinos AI Node roster unavailable all cycle (${st.aiReads.lastError ?? "no successful read"}) — the AI pools paid nobody and their share carried over.`
           : null,
     };
     st.history.unshift(record);
@@ -1092,7 +1123,7 @@ class DistributionEngine {
         };
       }
       const payoutTotal = st.payouts.reduce((acc, p) => addSats(acc, p.amountSat), "0");
-      // Who currently holds credit in each group — the live answer to "would I
+      // Who currently holds credit in each pool — the live answer to "would I
       // be paid, and out of which pot?".
       const creditCounts = {};
       for (const tier of TIERS) creditCounts[tier] = Object.keys(st.credits[tier] ?? {}).length;
@@ -1133,7 +1164,7 @@ module.exports = {
   nextCycleClose,
   mergeSeen,
   mergeAiSeen,
-  tierFor,
+  tiersFor,
   classifyCandidates,
   splitPool,
   settleCycle,
