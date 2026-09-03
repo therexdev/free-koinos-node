@@ -30,6 +30,7 @@ const { quoteSwap } = require("./lib/koindx");
 const { quoteEthToVkoin, quoteVkoinOut, applySlippage } = require("./lib/eth-swap");
 const { compareRoutes, descriptor } = require("./lib/fund-routes");
 const { KoinPrice, nodeValueUsd } = require("./lib/koin-price");
+const { encodeQr } = require("./lib/qr");
 const { LastGood } = require("./lib/last-good");
 
 // Shared Coinbase Onramp endpoint + app-identity key (see onramp-endpoint/). At
@@ -862,6 +863,16 @@ function registerIpc({ settings, state, wallet, chain, nodeMgr, setup, rewards, 
   handle("util:copy", ({ text }) => {
     clipboard.writeText(String(text ?? ""));
     return true;
+  });
+
+  // A QR code for an address, as a matrix of booleans the renderer draws as
+  // SVG. Encoded here because the window loads no third-party script at all —
+  // its CSP allows none — and because it is worth unit-testing.
+  handle("util:qr", ({ text }) => {
+    const value = String(text ?? "").trim();
+    if (!value) throw new Error("Nothing to encode");
+    const { version, size, modules } = encodeQr(value);
+    return { text: value, version, size, modules };
   });
 
   handle("util:openExternal", ({ url }) => {

@@ -317,3 +317,12 @@ pre.logs {
 }
 .split-table .split-rest td { border-top: 1px solid var(--border); padding-top: 9px; }
 .split-table .split-rest .split-pct { color: var(--text); }
+
+/* QR codes are always dark-on-white with a quiet zone, whatever the app theme —
+   an inverted or borderless code is what scanners fail on. The white frame is
+   part of the code, not decoration. */
+.qr-frame {
+  width: min(300px, 72vw); margin: 0 auto; background: #fff;
+  border-radius: 10px; box-shadow: 0 6px 24px rgba(0, 0, 0, 0.35); line-height: 0;
+}
+.qr-frame svg { display: block; border-radius: 10px; }

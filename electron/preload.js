@@ -72,6 +72,7 @@ const CHANNELS = new Set([
   "fund:ethSendMax",
   "fund:ethSend",
   "util:copy",
+  "util:qr",
   "util:openExternal",
   "util:openPath",
 ]);

@@ -193,6 +193,17 @@ that they clear, because a ten-minute-old balance is no longer worth showing.
 Mana is read the same way rather than defaulting to zero, so a failed call can
 never look like an empty mana bar.
 
+## Receiving funds
+
+Every address the app shows has a **QR code** button beside it — your Koinos
+address on the Wallet tab, and your Ethereum funding address on both the Wallet
+and Fund tabs. It opens a scannable code so you can send from a phone wallet or
+an exchange withdrawal screen without retyping 42 characters.
+
+The code is generated inside the app (the window loads no third-party script at
+all) and is always drawn dark-on-white with a quiet zone, whatever theme you are
+using, because that is what scanners actually read.
+
 ## Switching over from Koinos Node Desktop
 
 Your existing producer key works here unchanged — either way, the node you
@@ -250,6 +261,7 @@ electron/lib/
   producer-stats.js         on-chain production totals (rewards, VHP consumed)
   wallet.js, keystore.js    encrypted keystore (compatible with Koinos Node
                             Desktop wallet.json)
+  qr.js                     QR encoder for the receive-address codes
 ui/                         renderer (vanilla HTML/CSS/JS)
 test/                       node --test suite
 ```
