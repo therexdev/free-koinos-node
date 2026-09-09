@@ -7,7 +7,14 @@ const { execFile, spawn } = require("child_process");
 const { NETWORKS } = require("./constants");
 const { parseSha256File, analyzeMembers, requiredSpace, fmtBytes } = require("./quicksync-utils");
 const { httpHead, httpGetText, httpDownload } = require("./download");
-const { assessHealth, describeRecovery, classifyCrash, isCrashLooping } = require("./node-health");
+const {
+  assessHealth,
+  describeRecovery,
+  classifyCrash,
+  isCrashLooping,
+  parseIndexProgress,
+  serviceTrouble,
+} = require("./node-health");
 
 const OP_LOG_LIMIT = 400;
 const ARCHIVE_NAME = "koinos-backup.tar.gz";
@@ -21,6 +28,12 @@ const SAVER_AFTER_OOM = 2; // OOM-driven recoveries before switching to memory-s
 const CHRONIC_AFTER = 5; // low-memory recoveries in the window before we suggest the cloud
 const REPAIR_AFTER = 3; // restarts that didn't stick before we call for a data repair
 const MAX_BACKOFF_MS = 15 * 60 * 1000;
+
+// ----- rebuild-from-local-blocks tuning -----
+const REBUILD_POLL_MS = 20 * 1000; // how often we read chain logs for re-index progress
+const REBUILD_SILENCE_MS = 20 * 60 * 1000; // no height movement this long => say so (never auto-abort)
+const REBUILD_REPORT_MAX_MS = 6 * 3600 * 1000; // stop *reporting* progress after this; the replay carries on
+const REBUILD_INDEX_MAX_MS = 24 * 3600 * 1000; // outer bound on suppressing the stall check after a rebuild
 
 // Manages a per-network Koinos node directory containing the official
 // docker-compose.yml plus generated .env and config files, and drives it
@@ -251,11 +264,17 @@ class NodeManager {
     return this.autoRecover;
   }
 
-  _startWatchdog(networkId, producing, producerAddress, memorySaver) {
+  // opts.indexing marks a node that is legitimately replaying the chain after a
+  // rebuild: its head genuinely doesn't move for hours, which is exactly what the
+  // stall detector is built to punish. Only that one check is suspended —
+  // crash, OOM and service-down detection stay fully live.
+  _startWatchdog(networkId, producing, producerAddress, memorySaver, opts = {}) {
     this._stopWatchdog();
     const now = Date.now();
     const w = {
       networkId,
+      indexing: !!opts.indexing,
+      indexingUntil: now + REBUILD_INDEX_MAX_MS,
       producing: !!producing,
       producerAddress: producerAddress || null,
       memorySaver: !!memorySaver,
@@ -295,6 +314,10 @@ class NodeManager {
       w.lastHeight = headHeight;
       w.lastHeightAt = now;
     }
+    // chain only answers for its head once it's done indexing, so the first
+    // reading ends the replay window. The deadline is the backstop for a node
+    // with no RPC service running, where a head reading never arrives at all.
+    if (w.indexing && (headHeight != null || now > w.indexingUntil)) w.indexing = false;
     // Grace window: don't judge a node that's still starting up or resyncing.
     if (now < w.graceUntil) {
       w.health = { ok: true, reason: "starting" };
@@ -308,7 +331,7 @@ class NodeManager {
       lastHeight: w.lastHeight,
       lastHeightAt: w.lastHeightAt,
       now,
-      stallMs: STALL_MS,
+      stallMs: w.indexing ? Infinity : STALL_MS,
     });
     w.health = health;
     // Once we've concluded the block data is corrupted, stop restarting into the
@@ -329,7 +352,7 @@ class NodeManager {
     let crash = null;
     let logText = "";
     try {
-      logText = await this.logs(w.networkId, health.service || "block_store", 80).catch(() => "");
+      logText = await this.logs(w.networkId, health.service || "block_store", 200).catch(() => "");
       crash = classifyCrash(logText);
     } catch {
       /* diagnosis is best-effort */
@@ -342,6 +365,42 @@ class NodeManager {
     const memoryTrouble = crash === "oom" || health.oom || health.reason === "oom";
     const dataCrash = crash === "panic" || crash === "corruption";
     const looping = isCrashLooping(logText);
+
+    // A state/receipt mismatch is deterministic — the chain re-indexes into the
+    // exact same wall on every restart, so never spend restarts on it. The state
+    // is rebuildable from the blocks already on disk, which costs no download and
+    // frees space on the way, so with auto-recover on we just do it.
+    if (crash === "state-mismatch") {
+      w.needsRepair = true;
+      w.repairReason = "state-mismatch";
+      w.recovering = false;
+      const producerAddress = w.producerAddress;
+      if (this.autoRecover) {
+        this.onEvent({
+          type: "node",
+          level: "warn",
+          message:
+            "Your node's chain state got damaged, so it stopped. Rebuilding it from the blocks already on your disk — no download needed. This runs on its own and can take a while; you can watch it on the Node tab.",
+        });
+        try {
+          await this.rebuildState(w.networkId, producerAddress);
+        } catch (e) {
+          this.onEvent({
+            type: "node",
+            level: "error",
+            message: `Couldn't start the rebuild automatically (${String(e?.message ?? e)}). Open the Node tab and click “Rebuild from local blocks”.`,
+          });
+        }
+      } else {
+        this.onEvent({
+          type: "node",
+          level: "warn",
+          message:
+            "Your node's chain state got damaged — restarting can't fix it. Open the Node tab and click “Rebuild from local blocks” to replay it from blocks you already have (no download).",
+        });
+      }
+      return;
+    }
 
     // Corrupted/panicking block data, or restarts that plainly aren't sticking:
     // stop the futile loop and call for a one-click repair instead.
@@ -426,6 +485,247 @@ class NodeManager {
     if (!this._op) return null;
     const { lines, ...rest } = this._op;
     return { ...rest, tail: lines.slice(-15) };
+  }
+
+  // ---------- rebuild state (re-index from the local block store) ----------
+  //
+  // The cheap repair for "replayed state delta merkle root does not match block
+  // receipt": the chain's STATE database is corrupt, but block_store still holds
+  // every block. Deleting the state and letting chain's indexer replay it from
+  // local disk needs no download at all, and frees space *before* it uses any —
+  // which matters, because that failure often strands a node whose disk is too
+  // full for Quick Sync's 2.6x archive headroom.
+  //
+  // Quick sync remains the fallback: if the replay hits the same mismatch, the
+  // damaged side is block_store, and only re-fetching blocks can fix it.
+
+  async rebuildInfo(networkId) {
+    const d = this.dirs(networkId);
+    const [chainBytes, blockStoreBytes] = await Promise.all([
+      dirSize(path.join(d.basedir, "chain")),
+      dirSize(path.join(d.basedir, "block_store")),
+    ]);
+    const services = await this.services(networkId).catch(() => []);
+    return {
+      chainBytes, // freed the moment the rebuild starts
+      blockStoreBytes, // what it replays from; no block_store, no rebuild
+      hasBlockStore: blockStoreBytes > 0,
+      nodeRunning: services.some((s) => /running|up/i.test(s.state)),
+    };
+  }
+
+  // Fire-and-forget; progress is exposed through currentOp() like start/quick-sync.
+  // The op deliberately stays "running" for the whole re-index: _watchTick() bails
+  // out while an op is in flight, which keeps the stall detector from mistaking a
+  // legitimately long replay for a wedged node and restarting on top of it.
+  async rebuildState(networkId, producerAddress) {
+    if (this._op?.running) {
+      throw new Error(`Another node operation ("${this._op.name}") is still running`);
+    }
+    const info = await this.rebuildInfo(networkId);
+    if (!info.hasBlockStore) {
+      throw new Error(
+        "There are no local blocks to rebuild from — block_store is empty. Use Quick sync instead."
+      );
+    }
+    // Read the memory-saver setting before stopping the watchdog — _stopWatchdog()
+    // clears this._watch, and the rebuild must come back up in the same mode it
+    // went down in.
+    const memorySaver = this._watch?.memorySaver || false;
+    this._desiredRunning = false;
+    this._stopWatchdog();
+    const op = {
+      name: "rebuild-state",
+      network: networkId,
+      running: true,
+      startedAt: Date.now(),
+      finishedAt: null,
+      lines: [],
+      code: null,
+      error: null,
+      progress: { stage: "starting", pct: null },
+    };
+    this._op = op;
+    this._rebuildAbort = new AbortController();
+    this._runRebuildState(networkId, producerAddress || null, op, memorySaver)
+      .then((res) => {
+        op.running = false;
+        op.finishedAt = Date.now();
+        op.code = 0;
+        this.onEvent({
+          type: "node",
+          message: res?.cancelled
+            ? "Rebuild stopped. Progress is saved — starting the node picks the replay up where it left off."
+            : "Rebuild complete — your node replayed the chain from its own blocks and is back in sync.",
+        });
+      })
+      .catch((e) => {
+        const msg = String(e?.message ?? e);
+        op.running = false;
+        op.finishedAt = Date.now();
+        if (msg === "Cancelled") {
+          // The user pressed Stop mid-stage — not a failure.
+          op.code = 0;
+          this.onEvent({
+            type: "node",
+            message: "Rebuild stopped. Progress is saved — starting the node picks the replay up where it left off.",
+          });
+          return;
+        }
+        op.code = 1;
+        op.error = msg;
+        this.onEvent({ type: "node", level: "error", message: `Rebuild failed: ${op.error}` });
+      });
+    return { started: true };
+  }
+
+  cancelRebuild() {
+    if (this._op?.name === "rebuild-state" && this._op.running) {
+      this._rebuildAbort?.abort();
+      return { cancelling: true };
+    }
+    return { cancelling: false };
+  }
+
+  async _runRebuildState(networkId, producerAddress, op, memorySaver = false) {
+    const signal = this._rebuildAbort.signal;
+    const say = (stage, line, pct = null, extra = {}) => {
+      op.progress = { stage, pct, ...extra };
+      if (line) {
+        op.lines.push(line);
+        if (op.lines.length > OP_LOG_LIMIT) op.lines.splice(0, op.lines.length - OP_LOG_LIMIT);
+      }
+      if (signal.aborted) throw new Error("Cancelled");
+    };
+    const report = (stage, line, pct = null, extra = {}) => {
+      op.progress = { stage, pct, ...extra };
+      if (line) {
+        op.lines.push(line);
+        if (op.lines.length > OP_LOG_LIMIT) op.lines.splice(0, op.lines.length - OP_LOG_LIMIT);
+      }
+    };
+    const d = this.dirs(networkId);
+
+    // 1. Take the whole stack down. `stop` alone isn't enough: chain runs with
+    //    restart:always, so it would race us back up onto the files we're deleting.
+    say("stopping", "Stopping the node…");
+    const down = await this._compose(networkId, ["down", "--remove-orphans"], { timeout: 180000 });
+    if (!down.ok) throw new Error(`Could not stop the node: ${down.error}`);
+
+    // 2. Delete the corrupt state. No rollback copy on purpose — we only get here
+    //    because this data is unusable, and keeping it is exactly what runs a
+    //    tight disk out of room. block_store, config, .env, wallet, keys and the
+    //    p2p identity are all untouched.
+    say("clearing", "Discarding the damaged chain state (blocks and wallet are kept)…");
+    fs.rmSync(path.join(d.basedir, "chain"), { recursive: true, force: true });
+    // mempool is a pure cache of pending transactions; stale entries against a
+    // freshly replayed state are meaningless, and it's tiny.
+    fs.rmSync(path.join(d.basedir, "mempool"), { recursive: true, force: true });
+    fs.mkdirSync(path.join(d.basedir, "chain"), { recursive: true });
+
+    // 3. Back up. ensureFiles() re-writes config.yml/.env; genesis_data.json is
+    //    mounted in from config/, so the emptied chain dir is all chain needs.
+    say("starting", "Starting the node — it will replay the chain from your local blocks…");
+    this.ensureFiles(networkId, producerAddress, {
+      memorySaver,
+      accountHistory: this.accountHistory,
+    });
+    const up = await this._compose(networkId, ["up", "-d", "--remove-orphans"], { timeout: 300000 });
+    if (!up.ok) throw new Error(up.error || up.stderr?.slice(-200) || "compose up failed");
+    this._desiredRunning = true;
+
+    // 4. Arm the watchdog immediately, in indexing mode. Doing it here rather than
+    //    at the end means the node is never left unsupervised, however the
+    //    progress reporting below ends — and _watchTick() stays inert while this
+    //    op is still running, so the two never fight.
+    this._startWatchdog(networkId, !!producerAddress, producerAddress, memorySaver, { indexing: true });
+
+    // 5. Report replay progress. Bounded on purpose: completion is detected from
+    //    the chain's own logs or its RPC head, and a node running without the
+    //    jsonrpc profile may offer neither. Rather than poll forever, we stop
+    //    *reporting* after a while — the replay keeps going, and the watchdog is
+    //    already in charge of the node.
+    let lastHeight = null;
+    let lastMovedAt = Date.now();
+    let target = null; // announced once at boot; keep it once seen
+    const reportUntil = Date.now() + REBUILD_REPORT_MAX_MS;
+    for (;;) {
+      if (Date.now() > reportUntil) {
+        report(
+          "indexing",
+          "Still replaying — this is taking longer than the app follows along for. It carries on in the background; the Node tab shows the head once it finishes.",
+          null
+        );
+        return { cancelled: false };
+      }
+      if (signal.aborted) {
+        this._desiredRunning = false;
+        this._stopWatchdog();
+        await this._compose(networkId, ["stop"], { timeout: 180000 }).catch(() => {});
+        return { cancelled: true };
+      }
+      await sleep(REBUILD_POLL_MS, signal).catch(() => {});
+      if (signal.aborted) continue;
+
+      const logText = await this.logs(networkId, "chain", 200).catch(() => "");
+
+      // The one failure that means "stop, this won't work": the replay hit the
+      // same mismatch from clean state, so the bad data is in block_store and
+      // only re-fetching blocks (Quick sync) can fix it.
+      if (classifyCrash(logText) === "state-mismatch") {
+        throw new Error(
+          "The replay hit the same mismatch from a clean state, so the damaged data is in the stored blocks, not the chain state. Quick sync is the fix — it replaces both."
+        );
+      }
+
+      // Anything other than a mismatch — an OOM kill, a panic — is the
+      // watchdog's job, and it can't act while this op holds the floor. Stop
+      // reporting and let it take over.
+      const chainRow = (await this.services(networkId).catch(() => [])).find(
+        (r) => String(r?.service ?? r?.name ?? "") === "chain"
+      );
+      if (chainRow && serviceTrouble(chainRow).down) {
+        report(
+          "indexing",
+          "The chain service stopped during the replay — handing over to automatic recovery."
+        );
+        return { cancelled: false };
+      }
+
+      const parsed = parseIndexProgress(logText);
+      if (parsed.target != null) target = parsed.target;
+      if (parsed.height != null && (lastHeight == null || parsed.height > lastHeight)) {
+        lastHeight = parsed.height;
+        lastMovedAt = Date.now();
+      }
+      const pct =
+        target != null && lastHeight != null && target > 0
+          ? Math.max(0, Math.min(100, (lastHeight / target) * 100))
+          : null;
+
+      // Done: the replay reached the target it announced, or chain is answering
+      // for its head again — it only does that once indexing has finished.
+      const probed = this.probeHead ? await this.probeHead().catch(() => null) : null;
+      const reachedTarget = target != null && lastHeight != null && lastHeight >= target;
+      if (reachedTarget || probed != null) {
+        report("done", "Replay finished — catching up to the network from here.", 100);
+        return { cancelled: false };
+      }
+
+      const stalledFor = Date.now() - lastMovedAt;
+      const note =
+        stalledFor > REBUILD_SILENCE_MS
+          ? " (no movement recently — a long replay can go quiet for a while; it's still working)"
+          : "";
+      report(
+        "indexing",
+        lastHeight != null && target != null
+          ? `Replayed to block ${lastHeight.toLocaleString()} of ${target.toLocaleString()}${note}`
+          : `Replaying the chain from local blocks…${note}`,
+        pct,
+        { height: lastHeight, target }
+      );
+    }
   }
 
   // ---------- quick sync (restore from the official chain backup) ----------
@@ -696,6 +996,56 @@ class NodeManager {
 }
 
 // ---------- local helpers ----------
+
+// Abortable delay. Rejects on abort so a cancelled rebuild doesn't sit out the
+// rest of its poll interval before noticing.
+function sleep(ms, signal) {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) return reject(new Error("Cancelled"));
+    const t = setTimeout(() => {
+      signal?.removeEventListener?.("abort", onAbort);
+      resolve();
+    }, ms);
+    function onAbort() {
+      clearTimeout(t);
+      reject(new Error("Cancelled"));
+    }
+    signal?.addEventListener?.("abort", onAbort, { once: true });
+  });
+}
+
+// Total bytes under a directory. Used only to tell the user how much a rebuild
+// frees, so it's best-effort: unreadable entries are skipped, and a hard cap on
+// entries visited keeps a pathological tree from stalling the UI call.
+async function dirSize(dir, cap = 400000) {
+  let total = 0;
+  let seen = 0;
+  const stack = [dir];
+  while (stack.length) {
+    const cur = stack.pop();
+    let entries;
+    try {
+      entries = await fs.promises.readdir(cur, { withFileTypes: true });
+    } catch {
+      continue; // missing or unreadable — contributes nothing
+    }
+    for (const e of entries) {
+      if (++seen > cap) return total;
+      const full = path.join(cur, e.name);
+      if (e.isDirectory()) {
+        stack.push(full);
+      } else if (e.isFile()) {
+        try {
+          total += (await fs.promises.stat(full)).size;
+        } catch {
+          /* vanished mid-walk */
+        }
+      }
+    }
+  }
+  return total;
+}
+
 
 function sha256File(filePath, onProgress) {
   return new Promise((resolve, reject) => {

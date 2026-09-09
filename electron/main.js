@@ -474,6 +474,16 @@ function registerIpc({ settings, state, wallet, chain, nodeMgr, setup, rewards, 
   handle("node:quickSyncInfo", () => nodeMgr.quickSyncInfo(chain.network().id));
   handle("node:quickSync", () => nodeMgr.quickSync(chain.network().id));
   handle("node:quickSyncCancel", () => nodeMgr.cancelQuickSync());
+  handle("node:rebuildInfo", () => nodeMgr.rebuildInfo(chain.network().id));
+  handle("node:rebuildState", ({ produce } = {}) => {
+    let producerAddress = null;
+    if (produce) {
+      producerAddress = wallet.address;
+      if (!producerAddress) throw new Error("Create a wallet first to enable block production");
+    }
+    return nodeMgr.rebuildState(chain.network().id, producerAddress);
+  });
+  handle("node:rebuildCancel", () => nodeMgr.cancelRebuild());
 
   // ----- dashboard -----
   handle("dashboard:summary", async () => {

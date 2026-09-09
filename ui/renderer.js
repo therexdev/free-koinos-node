@@ -1184,6 +1184,7 @@ function renderNodeView() {
       <h1>Koinos node</h1>
       <div class="row">
         <button id="n-open" class="btn ghost">📁 Data folder</button>
+        <button id="n-rebuild" class="btn">🔄 Rebuild from local blocks</button>
         <button id="n-quicksync" class="btn" style="display:none">⚡ Quick sync</button>
         <button id="n-stop" class="btn">Stop</button>
         <button id="n-start" class="btn primary">Start node</button>
@@ -1241,6 +1242,7 @@ function renderNodeView() {
     );
   });
   $("#n-log-refresh").addEventListener("click", loadLogs);
+  $("#n-rebuild").addEventListener("click", onRebuild);
   const qsBtn = $("#n-quicksync");
   if (S.appInfo.settings.network === "mainnet") {
     qsBtn.style.display = "";
@@ -1256,6 +1258,63 @@ function fmtBytes(n) {
   if (v >= 1e9) return `${(v / 1e9).toFixed(1)} GB`;
   if (v >= 1e6) return `${(v / 1e6).toFixed(1)} MB`;
   return `${Math.round(v / 1e3)} kB`;
+}
+
+// Repair that needs no download: the chain's state DB is rebuilt by replaying
+// the blocks already in block_store. This is the right first move for a damaged
+// state — it frees space instead of demanding it, which matters on the full
+// disks that make Quick sync impossible in the first place.
+async function onRebuild() {
+  const btn = $("#n-rebuild");
+  busyButton(btn, true, "Checking…");
+  let info;
+  try {
+    info = await call("node:rebuildInfo");
+  } catch (e) {
+    busyButton(btn, false);
+    return toast(`Rebuild unavailable: ${e.message}`, "bad");
+  }
+  busyButton(btn, false);
+  if (!info.hasBlockStore) {
+    return showModal({
+      title: "🔄 Rebuild from local blocks",
+      body: `<p class="small">There are no local blocks to replay — this node's block store is empty,
+        so there's nothing to rebuild from. Use <b>Quick sync</b> to fetch a verified snapshot instead.</p>`,
+      actions: [{ label: "Close", class: "primary", onClick: (close) => close() }],
+    });
+  }
+  showModal({
+    title: "🔄 Rebuild from local blocks",
+    body: `
+      <p class="small">Replays the chain from the blocks already on your disk to rebuild its state.
+      <b>Nothing is downloaded</b>, and the damaged state is deleted first — so this
+      <b>frees</b> disk space instead of needing more. Your wallet, keys, node config and peer identity are untouched.</p>
+      <table style="margin:12px 0">
+        <tr><td class="muted small">Space freed right away</td><td class="mono small">${fmtBytes(info.chainBytes)}</td></tr>
+        <tr><td class="muted small">Blocks it replays from</td><td class="mono small">${fmtBytes(info.blockStoreBytes)}</td></tr>
+      </table>
+      <div class="banner warn">Replaying a full chain takes a long time — often hours of CPU. Progress shows on this page and you can stop at any point; a stopped rebuild resumes where it left off.</div>
+      ${info.nodeRunning ? `<div class="banner info">The node is running — it will be stopped, rebuilt, and started again automatically.</div>` : ""}
+      <p class="small muted">If the replay hits the same error from clean state, the damage is in the stored blocks rather than the state, and the app will tell you to run Quick sync instead.</p>`,
+    actions: [
+      { label: "Cancel", onClick: (close) => close() },
+      {
+        label: "Start rebuild", class: "primary",
+        onClick: async (close) => {
+          try {
+            await call("node:rebuildState", {
+              produce: !!(S.dashboard && S.dashboard.wallet.exists),
+            });
+            close();
+            toast("Rebuild started — progress shows on this page", "good");
+            refreshNode();
+          } catch (e) {
+            toast(e.message, "bad");
+          }
+        },
+      },
+    ],
+  });
 }
 
 async function onQuickSync() {
@@ -1551,6 +1610,26 @@ function patchNodeView() {
       await call("node:quickSyncCancel").catch(() => {});
       toast("Cancelling quick sync — the download can be resumed later", "warn");
     });
+  } else if (op?.running && op.name === "rebuild-state") {
+    const p = op.progress ?? {};
+    const stageLabels = {
+      starting: "Starting…", stopping: "Stopping node", clearing: "Clearing damaged state",
+      indexing: "Replaying chain from local blocks", done: "Done",
+    };
+    const pctText = p.pct != null ? ` — ${p.pct.toFixed(2)}%` : "";
+    const heightText =
+      p.height != null && p.target != null
+        ? ` (block ${Number(p.height).toLocaleString()} / ${Number(p.target).toLocaleString()})`
+        : "";
+    opEl.innerHTML = `<div class="banner info">
+      <div class="row spread"><span><span class="spin"></span> <b>Rebuild:</b> ${esc(stageLabels[p.stage] ?? p.stage ?? "working")}${pctText}${heightText}</span>
+      <button id="n-rb-cancel" class="btn ghost" style="padding:4px 10px">Stop</button></div>
+      ${p.pct != null ? `<div class="progress" style="margin-top:8px"><div style="width:${Math.min(100, p.pct).toFixed(2)}%"></div></div>` : ""}
+      <span class="mono small">${op.tail.slice(-2).map(esc).join("<br>")}</span></div>`;
+    $("#n-rb-cancel")?.addEventListener("click", async () => {
+      await call("node:rebuildCancel").catch(() => {});
+      toast("Stopping the rebuild — progress is saved and resumes on the next start", "warn");
+    });
   } else if (op?.running) {
     opEl.innerHTML = `<div class="banner info"><span class="spin"></span> <b>${esc(op.name)}</b> in progress…<br>
       <span class="mono small">${op.tail.slice(-4).map(esc).join("<br>")}</span></div>`;
@@ -1574,7 +1653,20 @@ function patchNodeView() {
   if (healthEl) {
     const h = n?.health;
     const recovered = h?.recoveries ? ` <span class="muted small">(recovered ${h.recoveries}× recently)</span>` : "";
-    if (h?.needsRepair) {
+    if (h?.needsRepair && h.repairReason === "state-mismatch") {
+      // The chain state is damaged but the blocks are fine — replaying them
+      // locally is the cheap fix, so lead with it and keep Quick sync as the
+      // fallback for when the blocks turn out to be the damaged side.
+      healthEl.innerHTML = `<div class="banner bad">
+        <b>Your node's chain state got damaged.</b> Restarting can't fix it — but the blocks on your disk are fine, so it can be rebuilt from them with <b>no download</b>. Your wallet, keys and settings are safe.
+        <div class="row" style="margin-top:8px;gap:8px">
+          <button id="n-repair-rebuild" class="btn primary" style="padding:6px 12px">🔄 Rebuild from local blocks</button>
+          <button id="n-repair" class="btn ghost" style="padding:6px 12px">⚡ Quick sync instead</button>
+        </div>
+      </div>`;
+      $("#n-repair-rebuild")?.addEventListener("click", onRebuild);
+      $("#n-repair")?.addEventListener("click", onQuickSync);
+    } else if (h?.needsRepair) {
       // Corrupted block data — a restart can't fix it. Offer the one-click rebuild.
       healthEl.innerHTML = `<div class="banner bad">
         <b>Your node's block data got corrupted.</b> Restarting won't fix it — it needs to be rebuilt from a verified snapshot. Your wallet, keys and settings are safe, and it takes a few minutes.

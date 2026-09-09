@@ -196,15 +196,26 @@ function classifyCrash(logText) {
   const t = String(logText || "");
   if (/\(137\)|signal:\s*killed|out of memory|cannot allocate memory|oom[-\s]?kill/i.test(t)) return "oom";
   if (/panic:|sigsegv|segmentation violation|nil pointer|invalid memory address|runtime error/i.test(t)) return "panic";
+  // The chain replays a block and the state root it computes doesn't match the
+  // one in that block's receipt. Deterministic: every restart re-indexes into
+  // the exact same wall, so restarting is pure waste. Checked before the generic
+  // corruption patterns because the remedy is cheaper — block_store is almost
+  // always fine, so the state can be rebuilt from local blocks with no download.
+  // Matched narrowly: a bare "Block application failed" is a benign warning when
+  // a peer feeds us a bad block, and must NOT land here.
+  if (/state delta merkle root does not match|merkle root does not match block receipt/i.test(t))
+    return "state-mismatch";
   if (/corruption|checksum mismatch|bad table|truncated|malformed|failed to open (the )?database/i.test(t))
     return "corruption";
   return null;
 }
 
-// The remedy a crash class calls for: "memory" (restart/lighten), "repair"
-// (rebuild block data via Quick Sync), or null (just restart).
+// The remedy a crash class calls for: "memory" (restart/lighten), "reindex"
+// (rebuild chain state from the local block store — no download), "repair"
+// (re-fetch block data via Quick Sync), or null (just restart).
 function crashRemedy(kind) {
   if (kind === "oom") return "memory";
+  if (kind === "state-mismatch") return "reindex";
   if (kind === "panic" || kind === "corruption") return "repair";
   return null;
 }
@@ -213,6 +224,44 @@ function crashRemedy(kind) {
 // crash as a deterministic loop (vs. a one-off) and escalate to repair.
 function isCrashLooping(logText, threshold = 2) {
   return (String(logText || "").match(/panic:/gi) || []).length >= threshold;
+}
+
+
+// Read re-index progress out of a `chain` log tail so a rebuild can show a real
+// progress bar instead of an opaque spinner. The chain logs its resume point
+// ("Opened database at block") and where it's headed ("Indexing to target
+// block"); heights appear on the block lines it applies along the way.
+// Returns { start, target, height, pct } with nulls where the log doesn't say.
+function parseIndexProgress(logText) {
+  const t = String(logText || "");
+  const num = (re) => {
+    const m = t.match(re);
+    return m ? Number(m[1]) : null;
+  };
+  const target = num(/Indexing to target block[^\n]*?Height:\s*(\d+)/i);
+  const start = num(/Opened database at block[^\n]*?Height:\s*(\d+)/i);
+
+  // Current height: the furthest block actually applied. Scan line by line and
+  // skip the two marker lines themselves — the target line quotes the target
+  // height, which would otherwise read as "already finished". Bounding by the
+  // target keeps unrelated numbers from inflating the bar.
+  let height = null;
+  for (const line of t.split(/\r?\n/)) {
+    if (/Indexing to target block|Opened database at block/i.test(line)) continue;
+    for (const m of line.matchAll(/Height:\s*(\d+)/gi)) {
+      const h = Number(m[1]);
+      if (target != null && h > target) continue;
+      if (height == null || h > height) height = h;
+    }
+  }
+
+  let pct = null;
+  if (target != null && height != null && target > 0) {
+    const from = start != null && start < target ? start : 0;
+    pct = ((height - from) / (target - from)) * 100;
+    pct = Math.max(0, Math.min(100, pct));
+  }
+  return { start, target, height, pct };
 }
 
 module.exports = {
@@ -227,4 +276,5 @@ module.exports = {
   classifyCrash,
   crashRemedy,
   isCrashLooping,
+  parseIndexProgress,
 };

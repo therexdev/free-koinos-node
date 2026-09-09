@@ -12,6 +12,7 @@ const {
   classifyCrash,
   crashRemedy,
   isCrashLooping,
+  parseIndexProgress,
 } = require("../electron/lib/node-health");
 
 // A real block_store crash tail (segfault in GetBlocksByHeight, seen looping).
@@ -22,6 +23,18 @@ block_store-1 | [signal SIGSEGV: segmentation violation code=0x1 addr=0x40 pc=0x
 block_store-1 | github.com/koinos/koinos-block-store/internal/bstore.(*RequestHandler).GetBlocksByHeight(...)
 block_store-1 | Koinos Block Store v1.1.0
 block_store-1 | panic: runtime error: invalid memory address or nil pointer dereference
+`;
+
+// A real `chain` crash tail: the state DB survived an unclean shutdown subtly
+// wrong, so replaying blocks from block_store diverged 37 blocks in and the
+// service exited. Restarting reproduces it exactly.
+const STATE_MISMATCH_LOG = `
+chain-1 | [controller.cpp:221] <info>: Opened database at block - Height: 39218246, ID: 0x12204d6c
+chain-1 | [indexer.cpp:73] <info>: Retrieving highest block from block store
+chain-1 | [indexer.cpp:98] <info>: Indexing to target block - Height: 39218301, ID: 0x1220f3d8
+chain-1 | [controller.cpp:820] <warning>: Block application failed - Height: 39218283 ID: 0x122040c4, with reason: replayed state delta merkle root does not match block receipt
+chain-1 | [koinos_chain.cpp:342] <fatal>: An unexpected error has occurred: replayed state delta merkle root does not match block receipt
+chain-1 | [koinos_chain.cpp:279] <info>: Caught signal, shutting down...
 `;
 
 const upRow = (service) => ({ service, state: "running", status: "Up 2 hours" });
@@ -200,4 +213,62 @@ test("isCrashLooping needs repeated panics, not a single one", () => {
   assert.equal(isCrashLooping(PANIC_LOG), true); // two panics in the tail
   assert.equal(isCrashLooping("panic: runtime error: nil pointer"), false); // one-off
   assert.equal(isCrashLooping("All tables opened; connected"), false);
+});
+
+// ---------- state-mismatch: rebuild locally, don't restart-loop ----------
+
+test("classifyCrash reads a replayed-state merkle mismatch as its own class", () => {
+  assert.equal(classifyCrash(STATE_MISMATCH_LOG), "state-mismatch");
+  // Rebuildable from local blocks — never a plain restart, never a download.
+  assert.equal(crashRemedy(classifyCrash(STATE_MISMATCH_LOG)), "reindex");
+});
+
+test("classifyCrash does not mistake a rejected peer block for a damaged state", () => {
+  // A bad block from a peer logs the same warning prefix but is survivable, and
+  // must not trigger a rebuild of a perfectly good state DB.
+  assert.equal(
+    classifyCrash("chain-1 | <warning>: Block application failed - Height: 123 ID: 0xabc"),
+    null
+  );
+});
+
+test("classifyCrash still reports OOM ahead of a mismatch in the same tail", () => {
+  // A node killed for memory mid-replay logs both; memory is the real cause and
+  // rebuilding would waste hours without fixing it.
+  assert.equal(classifyCrash(`${STATE_MISMATCH_LOG}\nchain-1 exited (137)`), "oom");
+});
+
+// ---------- parseIndexProgress ----------
+
+test("parseIndexProgress reports replay position, not the target line's height", () => {
+  const log = `
+chain-1 | Opened database at block - Height: 0, ID: 0x1220aa
+chain-1 | Indexing to target block - Height: 1000, ID: 0x1220bb
+chain-1 | Block application - Height: 250
+`;
+  assert.deepEqual(parseIndexProgress(log), { start: 0, target: 1000, height: 250, pct: 25 });
+});
+
+test("parseIndexProgress measures a resumed replay from where it resumed", () => {
+  const log = `
+chain-1 | Opened database at block - Height: 100
+chain-1 | Indexing to target block - Height: 200
+chain-1 | Block application - Height: 150
+`;
+  const { pct, height } = parseIndexProgress(log);
+  assert.equal(height, 150);
+  assert.equal(pct, 50); // halfway through the 100 blocks it actually has to do
+});
+
+test("parseIndexProgress ignores heights beyond the target and survives a quiet log", () => {
+  const noisy = `
+chain-1 | Indexing to target block - Height: 500
+block_store-1 | Stored block - Height: 999999
+chain-1 | Block application - Height: 400
+`;
+  assert.equal(parseIndexProgress(noisy).height, 400);
+  assert.deepEqual(parseIndexProgress("Connecting AMQP client..."), {
+    start: null, target: null, height: null, pct: null,
+  });
+  assert.deepEqual(parseIndexProgress(""), { start: null, target: null, height: null, pct: null });
 });
