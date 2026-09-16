@@ -19,6 +19,203 @@ const {
 
 const KOIN = (n) => String(BigInt(n) * 100000000n);
 
+// ---------- saved direct recipients ----------
+
+const directConfig = {
+  enabled: false, reburnPct: 40, sharePct: { ai: 0, producing: 30, both: 0 },
+  minVhpKoin: "10000", payoutHourUtc: 0, minPayoutKoin: "0.5", pollMinutes: 10,
+};
+
+test("saved addresses validate checksums, percentages, duplicates and the total budget", () => {
+  const { Signer } = require("koilib");
+  const address = Signer.fromSeed("saved recipient test only").getAddress();
+  const validate = (recipients, patch = {}) => validateDistributionConfig({ ...directConfig, ...patch, recipients });
+  assert.deepEqual(validate([{ address: ` ${address} `, label: " Treasury ", pct: "30" }]).recipients,
+    [{ address, label: "Treasury", pct: 30 }]);
+  assert.equal(validate([{ address, pct: 0 }]).recipients[0].pct, 0);
+  assert.throws(() => validate([{ address, pct: 31 }]), /101%/);
+  assert.throws(() => validate([{ address, pct: 10 }, { address: ` ${address} `, pct: 10 }]), /duplicate/);
+  assert.throws(() => validate([{ address: address.slice(0, -1) + (address.endsWith("1") ? "2" : "1"), pct: 1 }]), /valid Koinos address/);
+  for (const value of [-1, 101, 0.5, "", "NaN", "Infinity", null, true, undefined]) {
+    assert.throws(() => validate([{ address, pct: value }]), /whole percentage/);
+  }
+  for (const recipients of [{}, [null], [{ address: "", pct: 0 }]]) {
+    assert.throws(() => validate(recipients), /list|valid Koinos address/);
+  }
+  assert.throws(() => validate([{ address, label: "x".repeat(81), pct: 1 }]), /80 characters/);
+});
+
+function directSettlement(patch = {}) {
+  return settleCycle({
+    periodRewardsSat: KOIN(1100), periodVhpConsumedSat: KOIN(1000),
+    selfAddress: SELF, minPayoutSat: "0", reburnPct: 40,
+    sharePct: { producing: 30 }, credits: { producing: { [C]: "1" } },
+    recipients: [{ address: A, label: "Treasury", pct: 10 }, { address: B, label: "Team", pct: 5 }],
+    ...patch,
+  });
+}
+
+test("direct percentages use net profit and conserve funds alongside reburn and pools", () => {
+  const s = directSettlement();
+  assert.equal(s.reburnSat, KOIN(1040));
+  assert.equal(s.keptSat, KOIN(15));
+  assert.equal(s.recipientPaidSat, KOIN(15));
+  assert.deepEqual(s.recipients, [
+    { address: C, amountSat: KOIN(30) },
+    { address: A, amountSat: KOIN(10) },
+    { address: B, amountSat: KOIN(5) },
+  ]);
+  assert.equal(BigInt(s.reburnSat) + BigInt(s.keptSat) + BigInt(s.selfKeptSat) + BigInt(s.carryOutSat) +
+    s.recipients.reduce((sum, r) => sum + BigInt(r.amountSat), 0n), BigInt(KOIN(1100)));
+});
+
+test("saved recipient payments combine with community shares and never self-transfer", () => {
+  const s = directSettlement({
+    recipients: [{ address: C, pct: 10 }, { address: SELF, pct: 20 }],
+  });
+  assert.deepEqual(s.recipients, [{ address: C, amountSat: KOIN(40) }]);
+  assert.equal(s.selfKeptSat, KOIN(20));
+  assert.equal(s.keptSat, "0");
+});
+
+test("direct allocations ignore pool eligibility, weighting and roster holds", () => {
+  const s = directSettlement({ credits: {}, heldTiers: ["ai", "both"],
+    sharePct: { ai: 30 }, weighting: "even" });
+  assert.equal(s.carryOut.ai, KOIN(30));
+  assert.deepEqual(s.recipients, [{ address: A, amountSat: KOIN(10) }, { address: B, amountSat: KOIN(5) }]);
+});
+
+test("each saved address accumulates its own sub-minimum amount over cycles", () => {
+  const base = { periodRewardsSat: KOIN(1), periodVhpConsumedSat: "0", reburnPct: 0,
+    sharePct: {}, credits: {}, minPayoutSat: "50000000",
+    recipients: [{ address: A, pct: 25 }, { address: B, pct: 10 }] };
+  const first = directSettlement(base);
+  assert.deepEqual(first.recipientCarryOut, { [A]: "25000000", [B]: "10000000" });
+  assert.equal(first.recipients.length, 0);
+  const second = directSettlement({ ...base, recipientCarry: first.recipientCarryOut });
+  assert.deepEqual(second.recipients, [{ address: A, amountSat: "50000000" }]);
+  assert.deepEqual(second.recipientCarryOut, { [B]: "20000000" });
+  assert.equal(second.carryOutSat, "20000000");
+});
+
+test("removing a saved address preserves its carry and cannot pay it to a replacement", () => {
+  const removed = directSettlement({ minPayoutSat: KOIN(1), recipientCarry: { [C]: "25000000" } });
+  assert.equal(removed.recipientCarryOut[C], "25000000");
+  assert.equal(removed.recipientDetails.find((r) => r.address === C).pct, 0);
+  const released = directSettlement({ periodRewardsSat: "0", periodVhpConsumedSat: "0", recipients: [],
+    minPayoutSat: "0", recipientCarry: removed.recipientCarryOut });
+  assert.deepEqual(released.recipients, [{ address: C, amountSat: "25000000" }]);
+  assert.deepEqual(released.recipientCarryOut, {});
+});
+
+test("zero profit and zero-percent saved addresses allocate nothing new", () => {
+  assert.equal(directSettlement({ periodRewardsSat: KOIN(999) }).recipientPaidSat, "0");
+  const s = directSettlement({ recipients: [{ address: A, pct: 0 }] });
+  assert.equal(s.recipientPaidSat, "0");
+  assert.equal(s.keptSat, KOIN(30));
+});
+
+test("preview includes direct allocations and preserves rounding dust above Number precision", () => {
+  const profit = "9876543210123456789";
+  const cfg = { reburnPct: 0, sharePct: {}, recipients: [{ address: A, pct: 33 }, { address: B, pct: 67 }] };
+  const p = previewSplit(profit, cfg);
+  const s = directSettlement({ ...cfg, periodRewardsSat: profit, periodVhpConsumedSat: "0", credits: {} });
+  assert.equal(p.keptPct, 0);
+  assert.equal(p.kept, s.keptSat);
+  assert.deepEqual(p.recipients.map((r) => r.amount), s.recipients.map((r) => r.amountSat));
+  assert.equal(BigInt(p.kept) + p.recipients.reduce((sum, r) => sum + BigInt(r.amount), 0n), BigInt(profit));
+});
+
+test("saved settings and pending payouts survive disk reload, locking and recipient edits", async (t) => {
+  const fs = require("node:fs");
+  const os = require("node:os");
+  const path = require("node:path");
+  const { JsonStore } = require("../electron/lib/store");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "distribution-recipients-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const totals = { current: { rewards: "0", vhpConsumed: "0", blocks: 0 } };
+  const world = makeWorld({ totals, headers: [], vhp: {},
+    balances: { koin: KOIN(1000), mana: KOIN(1000), vhp: "0" } });
+  const settingsPath = path.join(dir, "settings.json");
+  const statePath = path.join(dir, "state.json");
+  world.engine.settings = new JsonStore(settingsPath, world.settings.data);
+  world.engine.state = new JsonStore(statePath);
+  world.engine.configure({ enabled: false, sharePct: { ai: 0, producing: 0, both: 0 },
+    recipients: [{ address: A, label: "Treasury", pct: 25 }, { address: B, label: "Reserve", pct: 0 }] });
+  world.engine.wallet = { status: () => ({ exists: true, unlocked: false, address: SELF }) };
+  await world.engine.tick("manual");
+  totals.current = { rewards: KOIN(110), vhpConsumed: KOIN(100), blocks: 1 };
+  const locked = await world.engine.tick("manual", { forceClose: true });
+  assert.equal(locked.last.outcome, "locked");
+  assert.equal(world.calls.transfers.length, 0);
+  const restarted = new DistributionEngine({ chain: world.engine.chain, wallet: {
+    status: () => ({ exists: true, unlocked: true, address: SELF }), signer: {},
+  }, settings: new JsonStore(settingsPath), state: new JsonStore(statePath), stats: world.engine.stats });
+  assert.deepEqual(restarted.config().recipients, [
+    { address: A, label: "Treasury", pct: 25 }, { address: B, label: "Reserve", pct: 0 },
+  ]);
+  // Removing A and adding C must not redirect A's already-queued 2.5 KOIN.
+  restarted.configure({ recipients: [{ address: C, label: "Replacement", pct: 25 }] });
+  await restarted.tick("manual");
+  assert.deepEqual(world.calls.transfers, [{ to: A, amountSat: "250000000" }]);
+  assert.equal(restarted.status().derived.queue.empty, true);
+  await restarted.tick("manual");
+  assert.equal(world.calls.transfers.length, 1);
+  const persisted = new JsonStore(statePath).get(`distribution.mainnet.${SELF}`);
+  assert.equal(persisted.payouts.length, 0);
+  assert.equal(persisted.history[0].recipientDetails[0].label, "Treasury");
+});
+
+test("engine pays saved addresses during an AI roster outage and still restores VHP", async () => {
+  const totals = { current: { rewards: "0", vhpConsumed: "0", blocks: 0 } };
+  const world = makeWorld({ totals, headers: [], vhp: {},
+    balances: { koin: KOIN(1000), mana: KOIN(1000), vhp: "0" },
+    cfg: { sharePct: { ai: 50, producing: 0, both: 0 }, recipients: [{ address: A, pct: 50 }] } });
+  await world.engine.tick("manual");
+  totals.current = { rewards: KOIN(110), vhpConsumed: KOIN(100), blocks: 1 };
+  const res = await world.engine.tick("manual", { forceClose: true });
+  assert.equal(res.last.outcome, "cycle-held");
+  assert.deepEqual(world.calls.burns, [KOIN(100)]);
+  assert.deepEqual(world.calls.transfers, [{ to: A, amountSat: KOIN(5) }]);
+  assert.equal(res.derived.carryByTier.ai, KOIN(5));
+});
+
+test("engine retries a failed direct payout while preserving mana and liquid reserves", async () => {
+  const totals = { current: { rewards: "0", vhpConsumed: "0", blocks: 0 } };
+  const balances = { koin: KOIN(15), mana: KOIN(100), vhp: "0" };
+  const world = makeWorld({ totals, headers: [], vhp: {}, balances,
+    cfg: { sharePct: { ai: 0, producing: 0, both: 0 }, recipients: [{ address: A, pct: 100 }] } });
+  await world.engine.tick("manual");
+  totals.current = { rewards: KOIN(10), vhpConsumed: "0", blocks: 1 };
+  let res = await world.engine.tick("manual", { forceClose: true });
+  assert.equal(res.derived.queue.payoutTotal, KOIN(10));
+  assert.equal(world.calls.transfers.length, 0); // preserve the 10 KOIN reserve
+  balances.koin = KOIN(100);
+  balances.mana = KOIN(5);
+  await world.engine.tick("manual");
+  assert.equal(world.calls.transfers.length, 0);
+  balances.mana = KOIN(100);
+  const transfer = world.engine.chain.transfer;
+  world.engine.chain.transfer = async () => { throw new Error("temporarily rejected"); };
+  res = await world.engine.tick("manual");
+  assert.equal(res.last.outcome, "tx-error");
+  assert.equal(res.derived.queue.payoutTotal, KOIN(10));
+  world.engine.chain.transfer = transfer;
+  await world.engine.tick("manual");
+  await world.engine.tick("manual");
+  assert.deepEqual(world.calls.transfers, [{ to: A, amountSat: KOIN(10) }]);
+});
+
+test("a rejected settings update leaves the saved configuration unchanged", () => {
+  const world = makeWorld({ totals: { current: { rewards: "0", vhpConsumed: "0" } }, headers: [], vhp: {},
+    balances: {}, cfg: { enabled: false } });
+  const before = structuredClone(world.engine.config());
+  assert.throws(() => world.engine.configure({ recipients: [{ address: "invalid", pct: 10 }] }), /valid Koinos address/);
+  assert.deepEqual(world.engine.config(), before);
+  assert.throws(() => world.engine.configure({ recipients: [{ address: A, pct: 10 }] }), /110%/);
+  assert.deepEqual(world.engine.config(), before);
+});
+
 // ---------- config validation ----------
 
 test("validateDistributionConfig normalizes and rejects bad values", () => {
@@ -30,6 +227,7 @@ test("validateDistributionConfig normalizes and rejects bad values", () => {
   assert.deepEqual(cfg, {
     enabled: true, weighting: "participation",
     reburnPct: 25, sharePct: { ai: 10, producing: 20, both: 30 },
+    recipients: [],
     aiRosterUrl: "", minVhpKoin: "10000", payoutHourUtc: 3, minPayoutKoin: "0.5", pollMinutes: 15,
   });
   const base = { sharePct: { ai: 0, producing: 100, both: 0 }, minVhpKoin: "1", payoutHourUtc: 0, minPayoutKoin: "1", pollMinutes: 10 };

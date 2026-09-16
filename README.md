@@ -33,7 +33,7 @@ With **Community distribution** enabled (Distribution tab):
    the app is briefly closed or the wallet is locked — the queue picks up where
    it left off.
 
-### Where the profit goes — four percentages
+### Where the profit goes
 
 Each cycle's profit is divided by percentages you set:
 
@@ -43,6 +43,7 @@ Each cycle's profit is divided by percentages you set:
 | 🤖 **Koinos AI Node** | Split between every address seen on the AI network |
 | ⛏️ **Producing** | Split between every node producing blocks with the minimum VHP |
 | ⭐ **Both** | Split between the nodes doing both — **on top of** the two slices above |
+| 📤 **Saved addresses** | Each saved address gets its own percentage, whether or not it runs a node |
 | 👛 **Whatever is left** | Stays in your wallet |
 
 The pools **overlap**. Run an AI node and you are in the AI pool; produce blocks
@@ -65,6 +66,35 @@ node (B), one producer (C), and one node doing both (A):
 The reburn is applied once at settlement, which is identical to taking it from
 every reward as it lands — it is a flat fraction either way. Set every share to
 0% and the app behaves exactly like a normal node that compounds.
+
+### Send a percentage to saved addresses
+
+In **Distribution → Saved addresses**, click **Add address**, enter a Koinos
+address, an optional name, and its whole percentage of profit. Add as many
+recipients as needed, then click **Save**. The list is saved on this node and
+survives closing/reopening the app. Set a recipient to **0%** to keep it saved
+without allocating more profit, or use **Remove** and save to delete it.
+
+All percentages share one budget: **reburn + community pools + saved addresses
+must be 100% or less**. For example, 40% reburn, 30% producing, 10% to address A,
+and 5% to address B leaves 15% in your wallet. With 100 KOIN of profit, A gets
+10 KOIN and B gets 5 KOIN. These are percentages of **profit after restoring
+consumed VHP**, not the gross block reward or wallet deposits.
+
+- Saved recipients need no AI-node, production, or minimum-VHP eligibility.
+- An address can also earn from community pools; its payable amounts are
+  combined into one transfer. Duplicate saved addresses are rejected.
+- Amounts below the minimum payout accumulate separately for that address.
+  They are never shared with other recipients. Rounding below one satoshi
+  stays in your wallet.
+- Changes apply at the next settlement, including the current cycle. Removing
+  or changing an address does not cancel or redirect payouts already queued
+  or accumulated for it. To release a removed address's small accumulated
+  amount, lower the minimum payout and settle a cycle.
+- Your own address keeps its share in the wallet without a self-transfer.
+- Daily timing, **Distribute now**, wallet unlocking, the liquid reserve and
+  mana limits work the same as for existing payouts. Pool weighting affects
+  community pools only; a roster outage does not hold saved-address payouts.
 
 **A requirement nobody is paid for is never measured.** With no AI slice funded
 the roster is never read at all; with no producing slice funded, block
@@ -149,6 +179,7 @@ never distributed.
 | Koinos AI Node | — | Share of profit for every node on the AI network |
 | Producing | 100% | Share of profit for every node producing with the minimum VHP |
 | Both | — | Extra share for nodes doing both, on top of the two above |
+| Saved addresses | empty | Address, optional name, and whole percentage of profit for each direct recipient |
 | How each pool's share is split | By rewards earned | Share ∝ the rewards each node was qualifying for; or a flat even split |
 | Minimum VHP to count as producing | 10,000 | 0 means any producer counts, whatever its stake |
 | Koinos AI Node roster URL | *(unset)* | Where the live AI-node roster is read (needed when an AI pool is funded) |

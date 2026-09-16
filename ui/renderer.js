@@ -2661,7 +2661,7 @@ function renderDistributionView() {
   const cfg = S.distribution?.config ?? S.appInfo.settings.distribution;
   root.innerHTML = `
     <h1>Community distribution</h1>
-    <p class="lead">Run your node for the network, not just yourself: the VHP each block consumes is automatically re-burned so your node keeps producing at the same level, and the <b>profit</b> is then carved up by percentage — once a day — between compounding, the pools you choose to reward, and your own wallet. Turn it off and the app behaves exactly like a normal node.</p>
+    <p class="lead">The VHP each block consumes is automatically re-burned so your node keeps producing at the same level. Split the remaining <b>profit</b> by percentage — once a day — between compounding, community pools, saved addresses, and your own wallet.</p>
     <div class="grid-2">
       <div class="card">
         <h2>⚙️ Configuration</h2>
@@ -2680,11 +2680,20 @@ function renderDistributionView() {
                 <td class="split-pct"><input id="di-pct-vhp" type="number" min="0" max="100" class="mono" value="${pct(cfg.sharePct?.producing)}">%</td></tr>
               <tr><td>⭐ <b>Both</b> <span class="muted small">— a bonus for doing both, <i>on top of</i> the two above</span></td>
                 <td class="split-pct"><input id="di-pct-both" type="number" min="0" max="100" class="mono" value="${pct(cfg.sharePct?.both)}">%</td></tr>
+              <tr><td>📤 <b>Saved addresses</b> <span class="muted small">— total of the recipients below</span></td>
+                <td class="split-pct"><span id="di-pct-recipients" class="mono">0</span>%</td></tr>
               <tr class="split-rest"><td>👛 <b>Stays in your wallet</b> <span class="muted small">— whatever the percentages leave over</span></td>
                 <td class="split-pct"><span id="di-pct-kept" class="mono">0</span>%</td></tr>
             </tbody>
           </table>
           <p class="hint" id="di-rule" style="margin-top:8px"></p>
+        </div>
+        <div class="field">
+          <h3>Saved addresses</h3>
+          <p class="hint">Give each address a whole percentage of the profit (0–100%). Recipients do not need to run a node. Set 0% to keep an address saved without adding new payouts.</p>
+          <div id="di-recipients" class="stack"></div>
+          <button id="di-add-recipient" class="btn" type="button">+ Add address</button>
+          <p class="hint">Click Save to keep the list on this node. Changes apply at the next settlement, including the current cycle. Existing queued or accumulated payouts stay with their original address; lowering the minimum payout can release a small accumulated amount after an address is removed.</p>
         </div>
         <label class="field"><span>How each pool's share is split between its members</span>
           <select id="di-weighting">
@@ -2721,7 +2730,7 @@ function renderDistributionView() {
     </div>
     <div class="card">
       <h2>🧾 Distribution cycles</h2>
-      <table><thead><tr><th>Closed</th><th>Profit</th><th>Reburned</th><th>Paid out</th><th>Nodes</th><th>Kept</th><th>Carried</th></tr></thead>
+      <table><thead><tr><th>Closed</th><th>Profit</th><th>Reburned</th><th>Allocated payouts</th><th>Recipients</th><th>Kept</th><th>Carried</th></tr></thead>
       <tbody id="di-history"></tbody></table>
     </div>
     <div class="card">
@@ -2735,7 +2744,9 @@ function renderDistributionView() {
   // surprise waiting until Save.
   const syncSplits = () => {
     const p = splitInputs();
-    const allocated = p.reburnPct + p.ai + p.producing + p.both;
+    const recipientPct = distributionRecipientInputs().reduce((sum, r) => sum + (Number(r.pct) || 0), 0);
+    const allocated = p.reburnPct + p.ai + p.producing + p.both + recipientPct;
+    $("#di-pct-recipients").textContent = String(recipientPct);
     const kept = 100 - allocated;
     const keptEl = $("#di-pct-kept");
     keptEl.textContent = String(kept);
@@ -2756,6 +2767,7 @@ function renderDistributionView() {
               p.ai > 0 ? `<b>${p.ai}%</b> to AI nodes` : null,
               p.producing > 0 ? `<b>${p.producing}%</b> to producers` : null,
               p.both > 0 ? `<b>${p.both}%</b> more to nodes doing both` : null,
+              recipientPct > 0 ? `<b>${recipientPct}%</b> to saved addresses` : null,
               kept > 0 ? `<b>${kept}%</b> stays with you` : null,
             ].filter(Boolean).join(" · ") +
             (p.both > 0 && p.ai > 0 && p.producing > 0
@@ -2765,12 +2777,42 @@ function renderDistributionView() {
   ["#di-pct-reburn", "#di-pct-ai", "#di-pct-vhp", "#di-pct-both"].forEach((sel) =>
     $(sel).addEventListener("input", syncSplits)
   );
+  const addRecipient = (recipient = {}) => {
+    const row = document.createElement("div");
+    row.className = "distribution-recipient";
+    row.innerHTML = `
+      <label class="field recipient-name"><span>Name (optional)</span>
+        <input class="di-recipient-label" maxlength="80" value="${esc(recipient.label ?? "")}" placeholder="e.g. Project treasury"></label>
+      <label class="field recipient-address"><span>Koinos address</span>
+        <input class="di-recipient-address mono" value="${esc(recipient.address ?? "")}" placeholder="Recipient address" spellcheck="false" autocomplete="off"></label>
+      <label class="field recipient-percentage"><span>Profit %</span>
+        <input class="di-recipient-pct mono" type="number" min="0" max="100" step="1" value="${esc(recipient.pct ?? 0)}"></label>
+      <button class="btn danger di-recipient-remove" type="button" aria-label="Remove saved address">Remove</button>`;
+    $(".di-recipient-remove", row).addEventListener("click", () => { row.remove(); syncSplits(); });
+    row.addEventListener("input", syncSplits);
+    $("#di-recipients").append(row);
+    return row;
+  };
+  for (const recipient of cfg.recipients ?? []) addRecipient(recipient);
+  $("#di-add-recipient").addEventListener("click", () => {
+    const row = addRecipient();
+    $(".di-recipient-address", row).focus();
+    syncSplits();
+  });
   syncSplits();
 
   $("#di-save").addEventListener("click", onSaveDistribution);
   $("#di-now").addEventListener("click", () => onDistributionTick("distribution:runNow", $("#di-now"), "Checking…"));
   $("#di-close").addEventListener("click", onDistributeNow);
   patchDistributionView();
+}
+
+function distributionRecipientInputs() {
+  return $$("#di-recipients .distribution-recipient").map((row) => ({
+    address: $(".di-recipient-address", row).value.trim(),
+    label: $(".di-recipient-label", row).value.trim(),
+    pct: $(".di-recipient-pct", row).value,
+  }));
 }
 
 // The four percentage boxes, clamped the way the engine clamps them.
@@ -2797,6 +2839,7 @@ async function onSaveDistribution() {
       weighting: $("#di-weighting").value,
       reburnPct: p.reburnPct,
       sharePct: { ai: p.ai, producing: p.producing, both: p.both },
+      recipients: distributionRecipientInputs(),
       aiRosterUrl: $("#di-roster").value.trim(),
       minVhpKoin: $("#di-minvhp").value.trim(),
       payoutHourUtc: Number($("#di-hour").value),
@@ -2862,6 +2905,7 @@ const DISTRIBUTION_OUTCOME_LABELS = {
   distributing: ["pill accent", "paying out…"],
   distributed: ["pill good", "all paid out"],
   "tx-error": ["pill bad", "tx failed"],
+  "invalid-config": ["pill bad", "check settings"],
 };
 
 const TIER_UI = {
@@ -2869,6 +2913,7 @@ const TIER_UI = {
   both: ["⭐", "Doing both (bonus)"],
   producing: ["⛏️", "Producing"],
   ai: ["🤖", "Koinos AI Node"],
+  recipients: ["📤", "Saved addresses"],
   kept: ["👛", "Stays in your wallet"],
 };
 const TIER_ORDER = ["both", "producing", "ai"];
@@ -2881,8 +2926,10 @@ function splitPills(cfg) {
   };
   add("reburn", pct(cfg.reburnPct));
   for (const tier of TIER_ORDER) add(tier, pct(cfg.sharePct?.[tier]));
+  const recipientPct = (cfg.recipients ?? []).reduce((sum, r) => sum + pct(r.pct), 0);
+  add("recipients", recipientPct);
   const kept =
-    100 - pct(cfg.reburnPct) - TIER_ORDER.reduce((a, t) => a + pct(cfg.sharePct?.[t]), 0);
+    100 - pct(cfg.reburnPct) - TIER_ORDER.reduce((a, t) => a + pct(cfg.sharePct?.[t]), 0) - recipientPct;
   if (kept > 0) parts.push(`<span class="pill">👛 ${kept}%</span>`);
   return parts.join(" ") || `<span class="pill">nothing allocated</span>`;
 }
@@ -2902,6 +2949,9 @@ function splitRows(split, creditCounts) {
   return [
     row("reburn", split.reburn, split.reburnPct, ""),
     ...TIER_ORDER.map((t) => row(t, split.tiers[t].amount, split.tiers[t].pct, members(t))),
+    ...(split.recipients ?? []).filter((r) => r.pct > 0).map((r) =>
+      `<div class="row spread"><span class="muted small" title="${esc(r.address)}">📤 ${esc(r.label || shortTx(r.address))} <span class="mono">${r.pct}%</span></span>
+        <span class="mono small">${fmtSat(r.amount, 4)} ${sym()}</span></div>`),
     row("kept", split.kept, Math.max(0, split.keptPct), ""),
   ].join("");
 }
@@ -2960,6 +3010,9 @@ function patchDistributionView() {
     ${c?.split ? splitRows(c.split, d?.creditCounts) : ""}
     <div class="row spread"><span class="muted">Carried from earlier cycles</span>
       <span class="mono">${d ? fmtSat(d.carry, 4) : "0"} ${sym()}</span></div>
+    ${Object.entries(d?.carryByRecipient ?? {}).map(([address, amount]) =>
+      `<div class="row spread"><span class="muted small" title="${esc(address)}">📤 ${esc(shortTx(address))} accumulated</span>
+        <span class="mono small">${fmtSat(amount, 8)} ${sym()}</span></div>`).join("")}
     <hr style="border-color:var(--border);border-style:solid;opacity:.4">
     <div class="row spread"><span class="muted">Reburn queued</span>
       <span class="mono">${q ? fmtSat(q.reburnOwed, 4) : "0"} ${sym()}</span></div>
@@ -2970,7 +3023,7 @@ function patchDistributionView() {
   if (hist) {
     const rows = (d?.history ?? []).map((h) => {
       const paid = h.tiers
-        ? TIER_ORDER.reduce((a, t) => addSatsUi(a, h.tiers[t]?.paidSat ?? "0"), "0")
+        ? TIER_ORDER.reduce((a, t) => addSatsUi(a, h.tiers[t]?.paidSat ?? "0"), h.recipientPaid ?? "0")
         : null;
       const perTier = h.tiers
         ? TIER_ORDER
@@ -2987,6 +3040,8 @@ function patchDistributionView() {
         <td class="mono">${h.kept ? fmtSat(h.kept, 4) : "0"}</td>
         <td class="mono">${fmtSat(h.carryOut, 4)}</td>
       </tr>${perTier ? `<tr><td colspan="7" class="muted small">${perTier}</td></tr>` : ""}${
+        (h.recipientDetails ?? []).filter((r) => r.pct > 0 || r.carryInSat !== "0").map((r) =>
+          `<tr><td colspan="7" class="muted small" title="${esc(r.address)}">📤 ${esc(r.label || r.address)} · ${r.pct}% → ${fmtSat(r.paidSat, 4)} allocated${r.carryOutSat !== "0" ? ` · ${fmtSat(r.carryOutSat, 8)} carried` : ""}</td></tr>`).join("")}${
         h.holdReason ? `<tr><td colspan="7" class="muted small">${esc(h.holdReason)}</td></tr>` : ""}`;
     });
     hist.innerHTML = rows.join("") || `<tr><td colspan="7" class="muted">No distributions yet.</td></tr>`;
