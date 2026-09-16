@@ -163,6 +163,7 @@ const DEFAULT_SETTINGS = {
     // from the requireVhpMinimum/requireAiNode gates this replaces, so an
     // upgrade never changes who gets paid (migrateDistributionConfig()).
     sharePct: null,           // { ai, producing, both }
+    recipients: [],           // [{ address, label, pct }] direct % of profit
     minVhpKoin: "10000",      // VHP a producer needs to count; "0" = any producer
     aiRosterUrl: "",          // where the live Koinos AI Node roster is read
     payoutHourUtc: 0,         // close the daily cycle at this UTC hour

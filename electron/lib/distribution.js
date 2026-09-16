@@ -22,6 +22,7 @@ const { fetchAiRoster, validateRosterUrl } = require("./ai-roster");
 //        sharePct.ai        to every node running a Koinos AI Node
 //        sharePct.producing to every node producing with the minimum VHP
 //        sharePct.both      to nodes doing both, ON TOP of the two above
+//        recipients[].pct  directly to each saved address, without pool gates
 //      Membership overlaps: qualify for both requirements and you are paid from
 //      all three pools. Each slice is split between the members of its pool
 //      (plus that pool's carry from earlier cycles), and whatever the
@@ -106,6 +107,7 @@ function migrateDistributionConfig(raw) {
   }
   delete cfg.requireVhpMinimum;
   delete cfg.requireAiNode;
+  cfg.recipients ??= [];
   return cfg;
 }
 
@@ -120,7 +122,29 @@ function activeDimensions(sharePct = {}) {
   };
 }
 
-function validateDistributionConfig(cfg) {
+function validateRecipients(raw, isValidAddress) {
+  if (!Array.isArray(raw)) throw new Error("Saved addresses must be a list");
+  const seen = new Set();
+  return raw.map((entry, i) => {
+    const address = typeof entry?.address === "string" ? entry.address.trim() : "";
+    const valid = isValidAddress || ((a) => require("koilib").utils.isChecksumAddress(a));
+    let ok = false;
+    try { ok = !!address && valid(address); } catch { /* invalid checksum */ }
+    if (!ok) throw new Error(`Saved address ${i + 1} is not a valid Koinos address`);
+    if (seen.has(address)) throw new Error(`Saved address ${i + 1} is a duplicate — combine its percentages in one row`);
+    seen.add(address);
+    const pct = Number(entry.pct);
+    if (!["number", "string"].includes(typeof entry.pct) || String(entry.pct).trim() === "" ||
+        !Number.isInteger(pct) || pct < 0 || pct > 100) {
+      throw new Error(`Saved address ${i + 1} needs a whole percentage between 0 and 100`);
+    }
+    const label = String(entry.label ?? "").trim();
+    if (label.length > 80) throw new Error(`Saved address ${i + 1} name must be 80 characters or fewer`);
+    return { address, label, pct };
+  });
+}
+
+function validateDistributionConfig(cfg, isValidAddress) {
   const c = migrateDistributionConfig(cfg);
   const minVhpKoin = String(c.minVhpKoin ?? "").trim();
   // "0" is allowed and means "any producer counts, whatever its stake".
@@ -153,10 +177,12 @@ function validateDistributionConfig(cfg) {
     producing: pctOf(c.sharePct?.producing),
     both: pctOf(c.sharePct?.both),
   };
-  const allocated = reburnPct + sharePct.ai + sharePct.producing + sharePct.both;
+  const recipients = validateRecipients(c.recipients, isValidAddress);
+  const allocated = reburnPct + sharePct.ai + sharePct.producing + sharePct.both +
+    recipients.reduce((sum, r) => sum + r.pct, 0);
   if (allocated > 100) {
     throw new Error(
-      `Reburn plus the three share percentages come to ${allocated}% — they can't add up to more than 100% of the profit`
+      `Reburn, pools and saved addresses come to ${allocated}% — they can't add up to more than 100% of the profit`
     );
   }
   return {
@@ -164,6 +190,7 @@ function validateDistributionConfig(cfg) {
     weighting,
     reburnPct,
     sharePct,
+    recipients,
     minVhpKoin,
     aiRosterUrl,
     payoutHourUtc: hour,
@@ -343,6 +370,8 @@ function settleCycle({
   reburnPct = 0,
   sharePct = {},
   heldTiers = [],
+  recipients: savedRecipients = [],
+  recipientCarry = {},
 }) {
   const rewards = cmpSats(periodRewardsSat, "0") > 0 ? periodRewardsSat : "0";
   const vhpConsumed = cmpSats(periodVhpConsumedSat, "0") > 0 ? periodVhpConsumedSat : "0";
@@ -408,6 +437,39 @@ function settleCycle({
     };
   }
 
+  // Direct allocations belong to their individual address. Below-minimum
+  // amounts survive edits/removal of that address; they can never be assigned
+  // to a replacement recipient or absorbed into a community pool.
+  const direct = new Map(savedRecipients.map((r) => [r.address, r]));
+  for (const address of Object.keys(recipientCarry)) {
+    if (!direct.has(address)) direct.set(address, { address, label: "", pct: 0 });
+  }
+  const recipientCarryOut = {};
+  const recipientDetails = [];
+  let recipientPaid = 0n;
+  for (const r of direct.values()) {
+    const alloc = (profit * BigInt(r.pct)) / 100n;
+    const carryIn = BigInt(recipientCarry[r.address] ?? "0");
+    const amount = alloc + carryIn;
+    kept -= alloc;
+    poolTotal += amount;
+    if (r.pct > 0 || amount > 0n) eligibleCount += 1;
+    const paid = amount > 0n && amount >= BigInt(minPayoutSat) ? amount : 0n;
+    if (paid > 0n) {
+      recipientPaid += paid;
+      if (paid > topShare) topShare = paid;
+      if (r.address === selfAddress) selfKept += paid;
+      else byAddress.set(r.address, (byAddress.get(r.address) ?? 0n) + paid);
+    } else if (amount > 0n) {
+      skippedBelowMin += 1;
+      recipientCarryOut[r.address] = amount.toString();
+    }
+    recipientDetails.push({
+      ...r, allocSat: alloc.toString(), carryInSat: carryIn.toString(),
+      paidSat: paid.toString(), carryOutSat: (amount - paid).toString(),
+    });
+  }
+
   const recipients = [...byAddress.entries()].map(([address, amount]) => ({
     address,
     amountSat: amount.toString(),
@@ -426,7 +488,10 @@ function settleCycle({
     selfKeptSat: selfKept.toString(),
     shareSat: topShare.toString(),
     carryOut,
-    carryOutSat: Object.values(carryOut).reduce((a, v) => addSats(a, v), "0"),
+    recipientDetails,
+    recipientPaidSat: recipientPaid.toString(),
+    recipientCarryOut,
+    carryOutSat: [...Object.values(carryOut), ...Object.values(recipientCarryOut)].reduce((a, v) => addSats(a, v), "0"),
     eligibleCount,
     skippedBelowMin,
     weighting,
@@ -533,7 +598,13 @@ function previewSplit(profitSat, cfg) {
     out.tiers[tier] = { pct, amount: slice(pct) };
     out.keptPct -= pct;
   }
-  out.kept = ((profit * BigInt(Math.max(0, out.keptPct))) / 100n).toString();
+  out.recipients = (cfg.recipients ?? []).map((r) => ({ ...r, amount: slice(r.pct) }));
+  out.recipientsPct = out.recipients.reduce((sum, r) => sum + r.pct, 0);
+  out.keptPct -= out.recipientsPct;
+  // Integer-division dust stays in the wallet, just as it does at settlement.
+  const allocated = [out.reburn, ...Object.values(out.tiers).map((t) => t.amount),
+    ...out.recipients.map((r) => r.amount)].reduce((sum, v) => sum + BigInt(v), 0n);
+  out.kept = (profit > allocated ? profit - allocated : 0n).toString();
   return out;
 }
 
@@ -559,7 +630,7 @@ class DistributionEngine {
   }
 
   configure(patch) {
-    const cfg = validateDistributionConfig({ ...this.config(), ...patch });
+    const cfg = validateDistributionConfig({ ...this.config(), ...patch }, (a) => this.chain.isValidAddress(a));
     this.settings.set("distribution", cfg);
     this.start();
     return cfg;
@@ -637,6 +708,7 @@ class DistributionEngine {
     st.payouts ??= [];
     st.history ??= [];
     st.actions ??= [];
+    st.recipientCarry ??= {};
     migrateState(st, cfg);
     return st;
   }
@@ -660,7 +732,12 @@ class DistributionEngine {
       this.last = { time: Date.now(), trigger, outcome, ...detail };
       return this.status();
     };
-    const cfg = this.config();
+    let cfg;
+    try {
+      cfg = validateDistributionConfig(this.config(), (a) => this.chain.isValidAddress(a));
+    } catch (e) {
+      return done("invalid-config", { message: `Distribution settings need attention: ${e.message}` });
+    }
     if (!cfg.enabled && trigger === "timer") return done("disabled");
     const ws = this.wallet.status();
     if (!ws.exists) return done("no-wallet");
@@ -870,7 +947,9 @@ class DistributionEngine {
           message: "Unlock the wallet so the pending reburn and payouts can be signed.",
         });
       }
-      progress = await this._drainQueue(cfg, st, address);
+      // Persist the closed cycle before the first transaction is attempted.
+      this.state.set(key, st);
+      progress = await this._drainQueue(cfg, st, address, key);
     }
 
     this.state.set(key, st);
@@ -888,7 +967,7 @@ class DistributionEngine {
       const msg = c.holdReason
         ? `Cycle closed but held: ${c.holdReason}`
         : c.recipientCount > 0 || cmpSats(c.selfKept, "0") > 0
-          ? `Cycle closed: ${formatAmount(c.pool)} KOIN split between ${c.eligibleCount} nodes ` +
+          ? `Cycle closed: ${formatAmount(c.pool)} KOIN allocated to pools and saved addresses ` +
             `(top share ${formatAmount(c.share)} KOIN) — ${reburnNote}.`
           : `Cycle closed: nothing to distribute yet (${formatAmount(c.pool)} KOIN carries over` +
             `${cmpSats(c.reburn, "0") > 0 ? `; ${reburnNote}` : ""}).`;
@@ -958,6 +1037,9 @@ class DistributionEngine {
       );
     }
 
+    for (const address of Object.keys(st.recipientCarry)) {
+      if (!this.chain.isValidAddress(address)) throw new Error("An accumulated saved-address payout has an invalid address");
+    }
     const settle = settleCycle({
       periodRewardsSat,
       periodVhpConsumedSat,
@@ -969,11 +1051,14 @@ class DistributionEngine {
       reburnPct: cfg.reburnPct,
       sharePct: cfg.sharePct,
       heldTiers,
+      recipients: cfg.recipients,
+      recipientCarry: st.recipientCarry,
     });
 
     if (cmpSats(settle.reburnSat, "0") > 0) st.reburnOwed = addSats(st.reburnOwed, settle.reburnSat);
     st.payouts.push(...settle.recipients);
     st.carry = settle.carryOut;
+    st.recipientCarry = settle.recipientCarryOut;
 
     const record = {
       time: now,
@@ -988,6 +1073,8 @@ class DistributionEngine {
       share: settle.shareSat,
       weighting: settle.weighting,
       tiers: settle.tiers,
+      recipientDetails: settle.recipientDetails,
+      recipientPaid: settle.recipientPaidSat,
       ticks: st.ticks,
       skippedBelowMin: settle.skippedBelowMin,
       eligibleCount: settle.eligibleCount,
@@ -995,13 +1082,15 @@ class DistributionEngine {
       selfKept: settle.selfKeptSat,
       carryOut: settle.carryOutSat,
       carryOutByTier: settle.carryOut,
+      carryOutByRecipient: settle.recipientCarryOut,
       seenCount: producers.length,
       aiSeenCount: Object.keys(st.aiSeen).length,
       poolCount: settle.eligibleCount,
       splits: {
         reburnPct: cfg.reburnPct,
         ...cfg.sharePct,
-        keptPct: 100 - cfg.reburnPct - cfg.sharePct.ai - cfg.sharePct.producing - cfg.sharePct.both,
+        recipients: cfg.recipients,
+        keptPct: previewSplit("0", cfg).keptPct,
         minVhpKoin: cfg.minVhpKoin,
       },
       // Set when the AI roster never answered this cycle — explains why the
@@ -1039,7 +1128,7 @@ class DistributionEngine {
   }
 
   // Execute as much of the queue as balances allow right now.
-  async _drainQueue(cfg, st, address) {
+  async _drainQueue(cfg, st, address, key) {
     let balances;
     try {
       balances = await this.chain.balances(address);
@@ -1079,6 +1168,8 @@ class DistributionEngine {
           this._logAction(st, { kind: "payout", to: action.address, amount: action.amountSat, txId: tx.txId });
           executed.push({ ...action, txId: tx.txId });
         }
+        // Save each completed action so an ordinary restart resumes the rest.
+        this.state.set(key, st);
       } catch (e) {
         txError = `${action.kind === "reburn" ? "Reburn" : `Payout to ${action.address}`} failed: ${String(e.message)}`;
         break; // leave the rest queued; next tick retries
@@ -1130,8 +1221,9 @@ class DistributionEngine {
       derived = {
         anchored: !!st.anchor,
         cycle,
-        carry: Object.values(st.carry).reduce((a, v) => addSats(a, v), "0"),
+        carry: [...Object.values(st.carry), ...Object.values(st.recipientCarry)].reduce((a, v) => addSats(a, v), "0"),
         carryByTier: st.carry,
+        carryByRecipient: st.recipientCarry,
         creditCounts,
         queue: {
           reburnOwed: st.reburnOwed,
